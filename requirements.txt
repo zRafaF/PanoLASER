@@ -1,0 +1,45 @@
+# --- PyTorch Ecosystem ---
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+xformers==0.0.28.post3
+
+# --- Core Math & Arrays ---
+numpy==1.26.4
+scipy
+pandas
+
+# --- Image Processing & Vision ---
+opencv-python
+Pillow
+imageio
+scikit-image
+kornia
+
+# --- 3D & Geometry ---
+open3d
+trimesh
+plyfile
+pypose
+evo
+
+# --- Model & Training Utils ---
+einops
+huggingface-hub
+safetensors
+scikit-learn
+tensorboard
+
+# --- Configuration & System ---
+hydra-core
+omegaconf
+yacs
+colorlog
+tqdm
+Cython
+numba
+
+# --- Web / UI (PanoVGGT dependencies) ---
+gradio==5.17.1
+fastapi==0.119.0
+flask==3.1.2
