@@ -62,7 +62,8 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
     run_btn.click(
         fn=process_pipeline,
         inputs=[input_img, zenith_slider, nadir_slider],
-        outputs=[output_rgb, output_depth]
+        outputs=[output_rgb, output_depth],
+        api_name=False
     )
 
 if __name__ == "__main__":
