@@ -130,24 +130,29 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
             
             # Moved outside the tabs so it is always visible
             download_ply = gr.File(label="💾 Download Full Dense Point Cloud (.ply)")
-
-    # FIX: Changed .change() to .release() to prevent UI freezing
+    
+    # Sliders use .release() so they don't freeze the UI while dragging
     target_width.release(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
     )
+    
     target_height.release(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'h'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
     )
+    
+    # Checkboxes and Numbers use .change()
     link_ratio.change(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
     )
-    step_size.release(
+    
+    # FIX: Reverted to .change() for the Number component
+    step_size.change(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
