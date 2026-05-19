@@ -60,42 +60,33 @@ class PanoVGGTExtractor:
     def process_frame(self, rgb_image: np.ndarray):
         """
         Runs a single RGB image through PanoVGGT to extract geometry.
-        Args:
-            rgb_image: (H, W, 3) uint8 numpy array in RGB format.
         """
-        # 1. Preprocess image (H, W, C) -> (C, H, W) -> float [0, 1]
         img_tensor = torch.from_numpy(rgb_image).float() / 255.0
         img_tensor = img_tensor.permute(2, 0, 1)
-        
-        # PanoVGGT expects Batch and Sequence dimensions: (B, N, C, H, W)
-        # B=1 (Batch), N=1 (Single frame)
         img_tensor = img_tensor.unsqueeze(0).unsqueeze(0).to(self.device)
         
-        # 2. Run Inference using bfloat16 mixed precision (as done in app.py)
-        # Note: If your GPU does not support bfloat16, fallback to float16
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
         with torch.amp.autocast("cuda", dtype=dtype):
             preds = self.model(img_tensor)
             
-        # 3. Extract Radial Depth
-        # Following app.py logic: prefer 'local_points' magnitude, fallback to 'depth'
+        # Extract native 3D points directly from the model
         if "local_points" in preds and preds["local_points"] is not None:
             lp = preds["local_points"]
             radial = torch.norm(lp, dim=-1)
+            points_out = lp.squeeze().cpu().float().numpy()  # (H, W, 3)
         elif "depth" in preds and preds["depth"] is not None:
-            radial = preds["depth"].clone()
+            raise RuntimeError("Model output depth but missing native 3D local_points.")
         else:
-            raise RuntimeError("Model output did not contain 'local_points' or 'depth'")
+            raise RuntimeError("Model output did not contain 'local_points'")
             
-        # 4. Format Outputs (remove Batch/Seq dims, move to CPU numpy)
         depth_out = radial.squeeze().cpu().float().numpy()
         
-        # Attempt to grab confidence if the model outputs it, otherwise default to 1.0
         conf_out = np.ones_like(depth_out)
         if "conf" in preds and preds["conf"] is not None:
              conf_out = preds["conf"].squeeze().cpu().float().numpy()
 
         return {
             "depth": depth_out,
-            "conf": conf_out
+            "conf": conf_out,
+            "points": points_out
         }

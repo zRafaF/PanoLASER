@@ -8,7 +8,6 @@ from PIL import Image
 
 from inference_engine.utils.masking import get_spherical_valid_mask
 from inference_engine.utils.visualization import visualize_polar_mask, visualize_depth
-from inference_engine.utils.geometry import unproject_equirectangular_to_points
 from pano_wrapper import PanoVGGTExtractor
 
 # Initialize the model wrapper globally
@@ -35,21 +34,18 @@ def create_plotly_figure(xyz_points, rgb_image, mask, max_points=150000):
     points_flat = xyz_points.reshape(-1, 3)[valid_mask_flat]
     colors_rgb = rgb_image.reshape(-1, 3)[valid_mask_flat]
     
-    # Subsample randomly to prevent the browser tab from crashing
     if len(points_flat) > max_points:
         indices = np.random.choice(len(points_flat), max_points, replace=False)
         points_flat = points_flat[indices]
         colors_rgb = colors_rgb[indices]
         
-    # Format colors for Plotly (rgb string format)
     colors_str = [f"rgb({r},{g},{b})" for r, g, b in colors_rgb]
     
-    # Map OpenCV coordinates to Plotly coordinates (Plotly Z is up, CV Y is down)
     fig = go.Figure(
         data=[go.Scatter3d(
-            x=points_flat[:, 0],      # X -> X
-            y=points_flat[:, 2],      # Z -> Y (Depth becomes forward)
-            z=-points_flat[:, 1],     # Y -> Z (Down becomes Up)
+            x=points_flat[:, 0],      
+            y=points_flat[:, 2],      
+            z=-points_flat[:, 1],     
             mode='markers',
             marker=dict(size=1.5, color=colors_str, opacity=1.0)
         )]
@@ -63,18 +59,13 @@ def create_plotly_figure(xyz_points, rgb_image, mask, max_points=150000):
     return fig
 
 def enforce_resolution(w, h, step, link, trigger):
-    """Calculates snapped resolution and ratio error based on the step size."""
-    step = max(1, int(step)) # Prevent division by zero
-    
+    step = max(1, int(step))
     if link:
-        # Standard Equirectangular ratio is 2:1
         if trigger == 'w': h = w / 2.0
         elif trigger == 'h': w = h * 2.0
             
-    # Snap to the nearest multiple of the step size
     w_snap = int(round(w / step) * step)
     h_snap = int(round(h / step) * step)
-    
     actual_ratio = w_snap / h_snap if h_snap > 0 else 0
     error = abs(2.0 - actual_ratio)
     
@@ -85,23 +76,20 @@ def process_pipeline(input_image_pil, zenith_limit, nadir_limit, target_width, t
     if input_image_pil is None:
         return None, None, None, None
     
-    # 1. Resize image to the strictly calculated dimensions
     input_image_pil = input_image_pil.resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
     input_image = np.array(input_image_pil)
     H, W = input_image.shape[:2]
     
-    # 2. Masking
     mask = get_spherical_valid_mask(H, W, zenith_deg=zenith_limit, nadir_deg=nadir_limit)
     masked_rgb_vis = visualize_polar_mask(input_image, mask)
     
-    # 3. Inference
     predictions = extractor.process_frame(input_image)
     depth_map = predictions["depth"]
+    xyz_points = predictions["points"]  # <-- Using the Native 3D Output
+    
     depth_map[~mask] = 0.0
     depth_vis = visualize_depth(depth_map)
     
-    # 4. Generate 3D Data
-    xyz_points = unproject_equirectangular_to_points(depth_map)
     plotly_fig = create_plotly_figure(xyz_points, input_image, mask)
     ply_file_path = create_point_cloud_ply(xyz_points, input_image, mask)
     
@@ -118,10 +106,9 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
             
             gr.Markdown("### Processing Resolution")
             with gr.Row():
-                step_size = gr.Number(value=14, label="Configurable Step Size (Model Patch Size)")
+                step_size = gr.Number(value=14, label="Step Size (Patch Size)")
                 link_ratio = gr.Checkbox(value=True, label="Link Aspect Ratio (2:1)")
                 
-            # Increased Limits to 4K Width
             target_width = gr.Slider(minimum=224, maximum=4096, value=1036, step=1, label="Target Width")
             target_height = gr.Slider(minimum=112, maximum=2048, value=518, step=1, label="Target Height")
             ratio_info = gr.Markdown("📐 **Processing Dimensions:** 1036 $\\times$ 518 | **Target Ratio:** 2.0 | **Actual:** 2.0000 | **Error:** 0.0000")
@@ -140,15 +127,17 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
                 
                 with gr.Tab("3D Web Visualizer (Subsampled)"):
                     output_3d = gr.Plot(label="Interactive Point Cloud (WebGL)")
-                    download_ply = gr.File(label="Download Dense Point Cloud for pano_viz.py")
+            
+            # Moved outside the tabs so it is always visible
+            download_ply = gr.File(label="💾 Download Full Dense Point Cloud (.ply)")
 
-    # Wire up the resolution sync logic
-    target_width.change(
+    # FIX: Changed .change() to .release() to prevent UI freezing
+    target_width.release(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
     )
-    target_height.change(
+    target_height.release(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'h'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
@@ -158,7 +147,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
     )
-    step_size.change(
+    step_size.release(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
