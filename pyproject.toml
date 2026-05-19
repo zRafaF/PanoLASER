@@ -1,9 +1,64 @@
 [project]
 name = "panolaser"
 version = "0.1.0"
-description = "Add your description here"
+description = "Training-Free Streaming 3D Reconstruction from Panoramic Video"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.11.*"
 dependencies = [
-    "opencv-python>=4.13.0.92",
+    # PyTorch Ecosystem
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "torchaudio==2.5.1",
+    "xformers==0.0.28.post3",
+    
+    # Core Math & Arrays
+    "numpy==1.26.4",
+    "scipy",
+    "pandas",
+    
+    # Image Processing & Vision
+    "opencv-python",
+    "pillow",
+    "imageio",
+    "scikit-image",
+    "kornia",
+    
+    # 3D & Geometry
+    "open3d",
+    "trimesh",
+    "plyfile",
+    "pypose",
+    "evo",
+    
+    # Model & Training Utils
+    "einops",
+    "huggingface-hub",
+    "safetensors",
+    "scikit-learn",
+    "tensorboard",
+    
+    # Configuration & System
+    "hydra-core",
+    "omegaconf",
+    "yacs",
+    "colorlog",
+    "tqdm",
+    "cython",
+    "numba",
+    
+    # Web / UI
+    "gradio==5.17.1",
+    "fastapi==0.119.0",
+    "flask==3.1.2",
 ]
+
+# Tell uv where to find the CUDA 12.4 PyTorch wheels
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
