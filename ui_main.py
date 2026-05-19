@@ -38,11 +38,15 @@ def create_point_cloud_ply(rgb_image, depth_map, mask):
     
     return ply_path
 
-def process_pipeline(input_image_pil, zenith_limit, nadir_limit):
+def process_pipeline(input_image_pil, zenith_limit, nadir_limit, target_width, target_height):
     if input_image_pil is None:
         return None, None, None
     
+    # 1. Resize image to the configurable dimensions 
+    # (Crucial to ensure compatibility with DINOv2 14x14 patches)
+    input_image_pil = input_image_pil.resize((target_width, target_height), Image.Resampling.LANCZOS)
     input_image = np.array(input_image_pil)
+    
     H, W = input_image.shape[:2]
     
     # Masking
@@ -69,9 +73,16 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
     with gr.Row():
         with gr.Column(scale=1):
             input_img = gr.Image(label="Input 360° Image", type="pil")
+            
+            gr.Markdown("### Processing Resolution (Multiples of 14)")
+            gr.Markdown("*1036x518 is the optimal native resolution for PanoVGGT.*")
+            target_width = gr.Slider(minimum=224, maximum=4144, value=1036, step=14, label="Target Width")
+            target_height = gr.Slider(minimum=112, maximum=2072, value=518, step=14, label="Target Height")
+            
             gr.Markdown("### Polar Exclusion Limits")
             zenith_slider = gr.Slider(minimum=0, maximum=90, value=75, step=1, label="Zenith Limit")
             nadir_slider = gr.Slider(minimum=-90, maximum=0, value=-60, step=1, label="Nadir Limit")
+            
             run_btn = gr.Button("Process Frame & Generate 3D", variant="primary")
             
         with gr.Column(scale=2):
@@ -85,7 +96,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
 
     run_btn.click(
         fn=process_pipeline,
-        inputs=[input_img, zenith_slider, nadir_slider],
+        inputs=[input_img, zenith_slider, nadir_slider, target_width, target_height],
         outputs=[output_rgb, output_depth, output_3d],
         api_name=False
     )
