@@ -8,49 +8,46 @@ This project uses a locked fork of PanoVGGT as a submodule (commit `1857537`).
 
 ## ⚙️ Installation & Setup
 
-We recommend using Python 3.11 and [`uv`](https://docs.astral.sh/uv/) for lightning-fast dependency management.
+We use [`uv`](https://docs.astral.sh/uv/) for deterministic, lightning-fast project and dependency management.
 
 ### 1. Clone the Repository
 Because this project relies on a submodule, ensure you clone recursively:
+
 ```bash
 git clone --recurse-submodules https://github.com/zRafaF/PanoLASER
 cd PanoLASER
 ```
 
-### 2. Create the Environment
+### 2. Sync the Environment
 
-Use `uv` to pull Python 3.10 (if you don't have it) and create a standard virtual environment:
-
-```bash
-uv venv --python 3.10 venv
-source venv/bin/activate  # On Windows, use: .venv\Scripts\activate
-```
-
-### 3. Install Dependencies
-
-Install all requirements using `uv`. We pass the PyTorch index URL here to ensure we grab the correct CUDA 12.4 wheels. *(Note: We strictly use `numpy==1.26.4` to maintain compatibility with Cython/Numba extensions).*
+Run the following command. `uv` will automatically pull Python 3.11 (the required version for maximum framework stability), create an isolated internal environment, and resolve/install all required dependencies (including the specific PyTorch CUDA 12.4 wheels) exactly as defined in the configuration:
 
 ```bash
-uv pip install -r requirements.txt --extra-index-url [https://download.pytorch.org/whl/cu124](https://download.pytorch.org/whl/cu124)
+uv sync
 ```
 
-### 4. Compile Cython Modules
+### 3. Compile Cython Modules
 
-PanoLASER relies on compiled C-extensions for fast point cloud registration and graph processing. Compile them using:
+PanoLASER relies on compiled C-extensions for fast point cloud registration and graph processing. Compile them using `uv run` to guarantee that the compilation script runs safely inside your locked workspace environment:
 
 ```bash
-python setup.py build_ext --inplace
+uv run python setup.py build_ext --inplace
 ```
 
-### 5. Download Pre-trained Weights
+### 4. Download Pre-trained Weights
 
-Download the PanoVGGT backbone weights into the `checkpoints` directory:
+Download the PanoVGGT backbone weights into the local `checkpoints` folder:
 
 ```bash
 mkdir -p checkpoints
-wget [https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt](https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt) -O checkpoints/model.pt
+wget https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt -O checkpoints/model.pt
 ```
 
-## Usage
+## 🚀 Usage
 
-*(Usage instructions for `demo.py` will be added here as the streaming pipeline is finalized.)*
+Whenever you execute scripts or run tests in this repository, prepend your command with `uv run` to automatically trigger execution inside the locked dependencies network without manually activating anything:
+
+```bash
+# Example for future streaming evaluation execution
+uv run python demo.py --window_size 20 --overlap 5
+```
