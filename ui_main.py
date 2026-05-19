@@ -76,25 +76,31 @@ def process_pipeline(input_image_pil, zenith_limit, nadir_limit, target_width, t
     if input_image_pil is None:
         return None, None, None, None
     
+    # Resize image to the strictly calculated dimensions
     input_image_pil = input_image_pil.resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
     input_image = np.array(input_image_pil)
     H, W = input_image.shape[:2]
     
+    # Masking
     mask = get_spherical_valid_mask(H, W, zenith_deg=zenith_limit, nadir_deg=nadir_limit)
     masked_rgb_vis = visualize_polar_mask(input_image, mask)
     
+    # Inference
     predictions = extractor.process_frame(input_image)
     depth_map = predictions["depth"]
-    xyz_points = predictions["points"]  # <-- Using the Native 3D Output
     
+    # FIX 2: Revert to our manual, pixel-perfect equirectangular unprojection!
+    xyz_points = unproject_equirectangular_to_points(depth_map)
+    
+    # Apply Mask to depth (Zero out the poles)
     depth_map[~mask] = 0.0
     depth_vis = visualize_depth(depth_map)
     
+    # Generate 3D Data
     plotly_fig = create_plotly_figure(xyz_points, input_image, mask)
     ply_file_path = create_point_cloud_ply(xyz_points, input_image, mask)
     
     return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), plotly_fig, ply_file_path
-
 
 # --- Gradio UI Layout ---
 with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine") as demo:
