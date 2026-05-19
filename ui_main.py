@@ -50,7 +50,6 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
     
     with gr.Row():
         with gr.Column(scale=1):
-            # Switched to 'filepath' to fix the TypeError during startup
             input_img = gr.Image(label="Input 360° Image (Equirectangular)", type="filepath")
             
             gr.Markdown("### Polar Exclusion Limits")
@@ -60,8 +59,9 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
             run_btn = gr.Button("Process Frame", variant="primary")
             
         with gr.Column(scale=2):
-            output_rgb = gr.Image(label="Masked Input (Excluded zones tinted red)", type="numpy")
-            output_depth = gr.Image(label="Masked Depth Map Prediction", type="numpy")
+            # FIX: Removed type="numpy" from the output components
+            output_rgb = gr.Image(label="Masked Input (Excluded zones tinted red)")
+            output_depth = gr.Image(label="Masked Depth Map Prediction")
 
     run_btn.click(
         fn=process_pipeline,
