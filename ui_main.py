@@ -1,5 +1,7 @@
 import gradio as gr
 import numpy as np
+import cv2
+import os
 from inference_engine.utils.masking import get_spherical_valid_mask, apply_mask_to_tensor
 from inference_engine.utils.visualization import visualize_polar_mask, visualize_depth
 from pano_wrapper import PanoVGGTExtractor
@@ -7,9 +9,19 @@ from pano_wrapper import PanoVGGTExtractor
 # Initialize the model wrapper globally so it stays in GPU memory
 extractor = PanoVGGTExtractor()
 
-def process_pipeline(input_image, zenith_limit, nadir_limit):
-    if input_image is None:
+def process_pipeline(image_path, zenith_limit, nadir_limit):
+    # Safe fallback if no image is uploaded
+    if not image_path or not os.path.exists(image_path):
         return None, None
+    
+    # Manually load the image via OpenCV to bypass Gradio's numpy schema bug
+    input_image = cv2.imread(image_path)
+    if input_image is None:
+        print(f"Error: Could not read image at {image_path}")
+        return None, None
+        
+    # OpenCV loads in BGR, Gradio and Models expect RGB
+    input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
     
     H, W = input_image.shape[:2]
     
@@ -23,7 +35,6 @@ def process_pipeline(input_image, zenith_limit, nadir_limit):
     predictions = extractor.process_frame(input_image)
     
     # 4. Apply mask to the Depth Map (zeroing out the poles)
-    # (Note: converting back and forth to numpy for visualization purposes)
     depth_map = predictions["depth"]
     depth_map[~mask] = 0.0  # Zero out invalid depth
     
@@ -39,7 +50,8 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
     
     with gr.Row():
         with gr.Column(scale=1):
-            input_img = gr.Image(label="Input 360° Image (Equirectangular)", type="numpy")
+            # Switched to 'filepath' to fix the TypeError during startup
+            input_img = gr.Image(label="Input 360° Image (Equirectangular)", type="filepath")
             
             gr.Markdown("### Polar Exclusion Limits")
             zenith_slider = gr.Slider(minimum=0, maximum=90, value=75, step=1, label="Zenith Limit (Top: +Degrees)")
@@ -48,8 +60,8 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
             run_btn = gr.Button("Process Frame", variant="primary")
             
         with gr.Column(scale=2):
-            output_rgb = gr.Image(label="Masked Input (Excluded zones tinted red)")
-            output_depth = gr.Image(label="Masked Depth Map Prediction")
+            output_rgb = gr.Image(label="Masked Input (Excluded zones tinted red)", type="numpy")
+            output_depth = gr.Image(label="Masked Depth Map Prediction", type="numpy")
 
     run_btn.click(
         fn=process_pipeline,
@@ -58,5 +70,6 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
     )
 
 if __name__ == "__main__":
-    # share=True creates a public huggingface link if you have firewall issues with your VM
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    # share=True resolves the 'localhost not accessible' crash on cloud VMs
+    # It will print a public *.gradio.live URL in the terminal for you to access.
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
