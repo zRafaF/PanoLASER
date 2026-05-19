@@ -10,11 +10,10 @@ from inference_engine.utils.masking import get_spherical_valid_mask
 from inference_engine.utils.visualization import visualize_polar_mask, visualize_depth
 from pano_wrapper import PanoVGGTExtractor
 
-# Initialize the model wrapper globally
 extractor = PanoVGGTExtractor()
 
 def create_point_cloud_ply(xyz_points, rgb_image, mask):
-    """Creates the full-density PLY file for local visualization."""
+    # Mask is (H, W), Points are (H, W, 3)
     valid_mask_flat = mask.flatten()
     points_flat = xyz_points.reshape(-1, 3)[valid_mask_flat]
     colors_flat = rgb_image.reshape(-1, 3)[valid_mask_flat] / 255.0
@@ -24,83 +23,50 @@ def create_point_cloud_ply(xyz_points, rgb_image, mask):
     pcd.colors = o3d.utility.Vector3dVector(colors_flat)
     
     temp_dir = tempfile.mkdtemp()
-    ply_path = os.path.join(temp_dir, "reconstruction_dense.ply")
+    ply_path = os.path.join(temp_dir, "reconstruction.ply")
     o3d.io.write_point_cloud(ply_path, pcd)
     return ply_path
 
-def create_plotly_figure(xyz_points, rgb_image, mask, max_points=150000):
-    """Creates a subsampled Plotly figure for robust in-browser rendering."""
+def create_plotly_figure(xyz_points, rgb_image, mask, max_points=100000):
     valid_mask_flat = mask.flatten()
     points_flat = xyz_points.reshape(-1, 3)[valid_mask_flat]
     colors_rgb = rgb_image.reshape(-1, 3)[valid_mask_flat]
     
     if len(points_flat) > max_points:
-        indices = np.random.choice(len(points_flat), max_points, replace=False)
-        points_flat = points_flat[indices]
-        colors_rgb = colors_rgb[indices]
+        idx = np.random.choice(len(points_flat), max_points, replace=False)
+        points_flat, colors_rgb = points_flat[idx], colors_rgb[idx]
         
-    colors_str = [f"rgb({r},{g},{b})" for r, g, b in colors_rgb]
-    
-    fig = go.Figure(
-        data=[go.Scatter3d(
-            x=points_flat[:, 0],      
-            y=points_flat[:, 2],      
-            z=-points_flat[:, 1],     
-            mode='markers',
-            marker=dict(size=1.5, color=colors_str, opacity=1.0)
-        )]
-    )
-    
-    fig.update_layout(
-        scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
-        margin=dict(l=0, r=0, b=0, t=0),
-        paper_bgcolor="#111111",
-    )
+    fig = go.Figure(data=[go.Scatter3d(
+        x=points_flat[:, 0], y=points_flat[:, 2], z=-points_flat[:, 1],
+        mode='markers', marker=dict(size=1.0, color=[f"rgb({r},{g},{b})" for r,g,b in colors_rgb])
+    )])
+    fig.update_layout(scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)), margin=dict(l=0,r=0,b=0,t=0))
     return fig
 
-def enforce_resolution(w, h, step, link, trigger):
-    step = max(1, int(step))
-    if link:
-        if trigger == 'w': h = w / 2.0
-        elif trigger == 'h': w = h * 2.0
-            
-    w_snap = int(round(w / step) * step)
-    h_snap = int(round(h / step) * step)
-    actual_ratio = w_snap / h_snap if h_snap > 0 else 0
-    error = abs(2.0 - actual_ratio)
-    
-    msg = f"📐 **Processing Dimensions:** {w_snap} $\\times$ {h_snap} | **Target Ratio:** 2.0 | **Actual:** {actual_ratio:.4f} | **Error:** {error:.4f}"
-    return w_snap, h_snap, msg
-
 def process_pipeline(input_image_pil, zenith_limit, nadir_limit, target_width, target_height):
-    if input_image_pil is None:
-        return None, None, None, None
+    if input_image_pil is None: return None, None, None, None
     
-    # Resize image to the strictly calculated dimensions
+    # 1. Prepare Image
     input_image_pil = input_image_pil.resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
     input_image = np.array(input_image_pil)
     H, W = input_image.shape[:2]
     
-    # Masking
+    # 2. Masking (Our only manual geometric intervention)
     mask = get_spherical_valid_mask(H, W, zenith_deg=zenith_limit, nadir_deg=nadir_limit)
     masked_rgb_vis = visualize_polar_mask(input_image, mask)
     
-    # Inference
-    predictions = extractor.process_frame(input_image)
-    depth_map = predictions["depth"]
+    # 3. Inference (Trusting PanoVGGT's native 3D points)
+    preds = extractor.process_frame(input_image)
     
-    # FIX 2: Revert to our manual, pixel-perfect equirectangular unprojection!
-    xyz_points = unproject_equirectangular_to_points(depth_map)
+    # We use the model's native 3D points!
+    xyz_points = preds["points"] 
+    depth_vis = visualize_depth(preds["depth"])
     
-    # Apply Mask to depth (Zero out the poles)
-    depth_map[~mask] = 0.0
-    depth_vis = visualize_depth(depth_map)
-    
-    # Generate 3D Data
-    plotly_fig = create_plotly_figure(xyz_points, input_image, mask)
-    ply_file_path = create_point_cloud_ply(xyz_points, input_image, mask)
-    
-    return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), plotly_fig, ply_file_path
+    # 4. Visualization
+    return (Image.fromarray(masked_rgb_vis), 
+            Image.fromarray(depth_vis), 
+            create_plotly_figure(xyz_points, input_image, mask),
+            create_point_cloud_ply(xyz_points, input_image, mask))
 
 # --- Gradio UI Layout ---
 with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine") as demo:
