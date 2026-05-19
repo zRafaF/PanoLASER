@@ -1,6 +1,7 @@
 import gradio as gr
 import numpy as np
 import open3d as o3d
+import plotly.graph_objects as go
 import tempfile
 import os
 from PIL import Image
@@ -13,58 +14,99 @@ from pano_wrapper import PanoVGGTExtractor
 # Initialize the model wrapper globally
 extractor = PanoVGGTExtractor()
 
-def create_point_cloud_ply(rgb_image, depth_map, mask):
-    """Converts depth/rgb into a 3D PLY file and returns the file path."""
-    # 1. Get 3D Coordinates
-    xyz_points = unproject_equirectangular_to_points(depth_map)
-    
-    # 2. Flatten arrays and apply the valid mask
+def create_point_cloud_ply(xyz_points, rgb_image, mask):
+    """Creates the full-density PLY file for local visualization."""
     valid_mask_flat = mask.flatten()
     points_flat = xyz_points.reshape(-1, 3)[valid_mask_flat]
-    colors_flat = rgb_image.reshape(-1, 3)[valid_mask_flat] / 255.0  # Open3D expects 0-1 colors
+    colors_flat = rgb_image.reshape(-1, 3)[valid_mask_flat] / 255.0
     
-    # 3. Create Open3D PointCloud object
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_flat)
     pcd.colors = o3d.utility.Vector3dVector(colors_flat)
     
-    # Optional: Downsample for smoother browser performance
-    pcd = pcd.voxel_down_sample(voxel_size=0.05)
-    
-    # 4. Save to a temporary .ply file for Gradio
     temp_dir = tempfile.mkdtemp()
-    ply_path = os.path.join(temp_dir, "reconstruction.ply")
+    ply_path = os.path.join(temp_dir, "reconstruction_dense.ply")
     o3d.io.write_point_cloud(ply_path, pcd)
-    
     return ply_path
+
+def create_plotly_figure(xyz_points, rgb_image, mask, max_points=150000):
+    """Creates a subsampled Plotly figure for robust in-browser rendering."""
+    valid_mask_flat = mask.flatten()
+    points_flat = xyz_points.reshape(-1, 3)[valid_mask_flat]
+    colors_rgb = rgb_image.reshape(-1, 3)[valid_mask_flat]
+    
+    # Subsample randomly to prevent the browser tab from crashing
+    if len(points_flat) > max_points:
+        indices = np.random.choice(len(points_flat), max_points, replace=False)
+        points_flat = points_flat[indices]
+        colors_rgb = colors_rgb[indices]
+        
+    # Format colors for Plotly (rgb string format)
+    colors_str = [f"rgb({r},{g},{b})" for r, g, b in colors_rgb]
+    
+    # Map OpenCV coordinates to Plotly coordinates (Plotly Z is up, CV Y is down)
+    fig = go.Figure(
+        data=[go.Scatter3d(
+            x=points_flat[:, 0],      # X -> X
+            y=points_flat[:, 2],      # Z -> Y (Depth becomes forward)
+            z=-points_flat[:, 1],     # Y -> Z (Down becomes Up)
+            mode='markers',
+            marker=dict(size=1.5, color=colors_str, opacity=1.0)
+        )]
+    )
+    
+    fig.update_layout(
+        scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
+        margin=dict(l=0, r=0, b=0, t=0),
+        paper_bgcolor="#111111",
+    )
+    return fig
+
+def enforce_resolution(w, h, step, link, trigger):
+    """Calculates snapped resolution and ratio error based on the step size."""
+    step = max(1, int(step)) # Prevent division by zero
+    
+    if link:
+        # Standard Equirectangular ratio is 2:1
+        if trigger == 'w': h = w / 2.0
+        elif trigger == 'h': w = h * 2.0
+            
+    # Snap to the nearest multiple of the step size
+    w_snap = int(round(w / step) * step)
+    h_snap = int(round(h / step) * step)
+    
+    actual_ratio = w_snap / h_snap if h_snap > 0 else 0
+    error = abs(2.0 - actual_ratio)
+    
+    msg = f"📐 **Processing Dimensions:** {w_snap} $\\times$ {h_snap} | **Target Ratio:** 2.0 | **Actual:** {actual_ratio:.4f} | **Error:** {error:.4f}"
+    return w_snap, h_snap, msg
 
 def process_pipeline(input_image_pil, zenith_limit, nadir_limit, target_width, target_height):
     if input_image_pil is None:
-        return None, None, None
+        return None, None, None, None
     
-    # 1. Resize image to the configurable dimensions 
-    # (Crucial to ensure compatibility with DINOv2 14x14 patches)
-    input_image_pil = input_image_pil.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    # 1. Resize image to the strictly calculated dimensions
+    input_image_pil = input_image_pil.resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
     input_image = np.array(input_image_pil)
-    
     H, W = input_image.shape[:2]
     
-    # Masking
+    # 2. Masking
     mask = get_spherical_valid_mask(H, W, zenith_deg=zenith_limit, nadir_deg=nadir_limit)
     masked_rgb_vis = visualize_polar_mask(input_image, mask)
     
-    # Inference
+    # 3. Inference
     predictions = extractor.process_frame(input_image)
     depth_map = predictions["depth"]
-    
-    # Apply Mask to depth (Zero out the poles)
     depth_map[~mask] = 0.0
     depth_vis = visualize_depth(depth_map)
     
-    # Generate 3D Point Cloud file
-    ply_file_path = create_point_cloud_ply(input_image, depth_map, mask)
+    # 4. Generate 3D Data
+    xyz_points = unproject_equirectangular_to_points(depth_map)
+    plotly_fig = create_plotly_figure(xyz_points, input_image, mask)
+    ply_file_path = create_point_cloud_ply(xyz_points, input_image, mask)
     
-    return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), ply_file_path
+    return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), plotly_fig, ply_file_path
+
 
 # --- Gradio UI Layout ---
 with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine") as demo:
@@ -74,10 +116,15 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
         with gr.Column(scale=1):
             input_img = gr.Image(label="Input 360° Image", type="pil")
             
-            gr.Markdown("### Processing Resolution (Multiples of 14)")
-            gr.Markdown("*1036x518 is the optimal native resolution for PanoVGGT.*")
-            target_width = gr.Slider(minimum=224, maximum=4144, value=1036, step=14, label="Target Width")
-            target_height = gr.Slider(minimum=112, maximum=2072, value=518, step=14, label="Target Height")
+            gr.Markdown("### Processing Resolution")
+            with gr.Row():
+                step_size = gr.Number(value=14, label="Configurable Step Size (Model Patch Size)")
+                link_ratio = gr.Checkbox(value=True, label="Link Aspect Ratio (2:1)")
+                
+            # Increased Limits to 4K Width
+            target_width = gr.Slider(minimum=224, maximum=4096, value=1036, step=1, label="Target Width")
+            target_height = gr.Slider(minimum=112, maximum=2048, value=518, step=1, label="Target Height")
+            ratio_info = gr.Markdown("📐 **Processing Dimensions:** 1036 $\\times$ 518 | **Target Ratio:** 2.0 | **Actual:** 2.0000 | **Error:** 0.0000")
             
             gr.Markdown("### Polar Exclusion Limits")
             zenith_slider = gr.Slider(minimum=0, maximum=90, value=75, step=1, label="Zenith Limit")
@@ -91,13 +138,36 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
                     output_rgb = gr.Image(label="Masked Input", type="pil")
                     output_depth = gr.Image(label="Masked Depth Map Prediction", type="pil")
                 
-                with gr.Tab("3D Point Cloud View"):
-                    output_3d = gr.Model3D(label="Dense Point Cloud Reconstruction", clear_color=[0.1, 0.1, 0.1, 1.0])
+                with gr.Tab("3D Web Visualizer (Subsampled)"):
+                    output_3d = gr.Plot(label="Interactive Point Cloud (WebGL)")
+                    download_ply = gr.File(label="Download Dense Point Cloud for pano_viz.py")
+
+    # Wire up the resolution sync logic
+    target_width.change(
+        fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
+        inputs=[target_width, target_height, step_size, link_ratio],
+        outputs=[target_width, target_height, ratio_info]
+    )
+    target_height.change(
+        fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'h'),
+        inputs=[target_width, target_height, step_size, link_ratio],
+        outputs=[target_width, target_height, ratio_info]
+    )
+    link_ratio.change(
+        fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
+        inputs=[target_width, target_height, step_size, link_ratio],
+        outputs=[target_width, target_height, ratio_info]
+    )
+    step_size.change(
+        fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
+        inputs=[target_width, target_height, step_size, link_ratio],
+        outputs=[target_width, target_height, ratio_info]
+    )
 
     run_btn.click(
         fn=process_pipeline,
         inputs=[input_img, zenith_slider, nadir_slider, target_width, target_height],
-        outputs=[output_rgb, output_depth, output_3d],
+        outputs=[output_rgb, output_depth, output_3d, download_ply],
         api_name=False
     )
 

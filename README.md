@@ -26,6 +26,13 @@ Run the following command. `uv` will automatically pull Python 3.11 (the require
 uv sync
 ```
 
+**NOTE**
+To run in instances that already have cuda torch and some other dependencies you can use the following command.
+
+```bash
+uv pip install --system -e .
+```
+
 ### 3. Compile Cython Modules
 
 PanoLASER relies on compiled C-extensions for fast point cloud registration and graph processing. Compile them using `uv run` to guarantee that the compilation script runs safely inside your locked workspace environment:
