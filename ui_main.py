@@ -81,20 +81,32 @@ def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_widt
     pcd = get_o3d_pcd(xyz_points, input_image, mask)
     return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), create_plotly_figure_from_pcd(pcd), save_pcd_to_ply(pcd, "single_frame")
 
-def process_sequence_ui(directory_path, decimation, zenith_limit, nadir_limit, target_width, target_height):
-    if not directory_path or not os.path.isdir(directory_path):
-        raise gr.Error("Invalid directory path provided.")
+def process_sequence_ui(dir_selection, decimation, zenith_limit, nadir_limit, target_width, target_height):
+    # 1. Extract path from selection
+    if not dir_selection:
+        raise gr.Error("No directory selected.")
     
+    # If file_count="multiple", dir_selection is a list. Get the first element.
+    selected_path = dir_selection[0] if isinstance(dir_selection, list) else dir_selection
+    
+    # 2. Make it absolute based on your root_dir (which is '.')
+    # This ensures it works regardless of where the script was launched
+    full_path = os.path.abspath(os.path.join(".", selected_path))
+    
+    if not os.path.isdir(full_path):
+        raise gr.Error(f"Invalid directory path: {full_path}")
+    
+    # 3. Proceed with file loading using the full absolute path
     valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
-    image_files = sorted([os.path.join(directory_path, f) for f in os.listdir(directory_path) 
+    image_files = sorted([os.path.join(full_path, f) for f in os.listdir(full_path) 
                           if f.lower().endswith(valid_exts)])
     
-    # Apply decimation (e.g., every 2nd or 3rd image)
+    # Apply decimation
     step = int(decimation)
     image_files = image_files[::step]
     
     if len(image_files) < 2:
-        raise gr.Error(f"Found only {len(image_files)} valid images. Please ensure directory contains at least 2 images.")
+        raise gr.Error(f"Found only {len(image_files)} valid images in {full_path}. Need at least 2.")
     
     frames = []
     masks = []
