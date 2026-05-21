@@ -47,31 +47,30 @@ class PanoVGGTExtractor:
         print("✅ PanoVGGT model loaded successfully.")
 
     @torch.no_grad()
-    def process_frame(self, rgb_image: np.ndarray):
-        # 1. Preprocess: [0, 255] -> [0, 1]
-        img_tensor = torch.from_numpy(rgb_image).float() / 255.0
-        img_tensor = img_tensor.permute(2, 0, 1)
-        
-        # We removed TF.Normalize. PanoVGGT expects raw [0,1] tensors here.
-        img_tensor = img_tensor.unsqueeze(0).unsqueeze(0).to(self.device)
+    def process_window(self, rgb_images_list: list):
+        """
+        Runs a temporal sequence of RGB images through PanoVGGT to extract 
+        joint geometry and relative camera poses.
+        """
+        tensors = []
+        for rgb_image in rgb_images_list:
+            t = torch.from_numpy(rgb_image).float() / 255.0
+            t = t.permute(2, 0, 1)
+            t = TF.normalize(t, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            tensors.append(t)
+            
+        # Stack to (N, C, H, W) and add Batch dimension -> (1, N, C, H, W)
+        seq_tensor = torch.stack(tensors, dim=0).unsqueeze(0).to(self.device)
         
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
         with torch.amp.autocast("cuda", dtype=dtype):
-            preds = self.model(img_tensor)
+            preds = self.model(seq_tensor)
             
-        # 2. Extract pure Radial Depth
-        if "depth" in preds and preds["depth"] is not None:
-            depth_out = preds["depth"].squeeze().cpu().float().numpy()
-        elif "local_points" in preds and preds["local_points"] is not None:
-            depth_out = torch.norm(preds["local_points"], dim=-1).squeeze().cpu().float().numpy()
-        else:
-            raise RuntimeError("Model output did not contain depth")
-            
-        conf_out = np.ones_like(depth_out)
-        if "conf" in preds and preds["conf"] is not None:
-             conf_out = preds["conf"].squeeze().cpu().float().numpy()
+        # Extract sequences
+        depth_out = preds["depth"].squeeze(0).cpu().float().numpy()      # (N, H, W)
+        poses_out = preds["camera_poses"].squeeze(0).cpu().float().numpy() # (N, 4, 4)
 
         return {
-            "depth": depth_out,
-            "conf": conf_out
+            "depths": depth_out,
+            "poses": poses_out
         }
