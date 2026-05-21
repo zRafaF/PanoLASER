@@ -28,6 +28,39 @@ class PanoStreamingEngine:
         self.prev_overlap_global_poses = []
         self.prev_overlap_masks = []
         self.is_first_window = True
+    
+    def _apply_sim3_to_pose(self, local_pose, R_align, t_align, scale):
+        """
+        Applies Sim(3) with an Uprightness Constraint to prevent floor/ceiling flipping.
+        """
+        # 1. Scale ONLY the translation component
+        L_scaled = local_pose.copy()
+        L_scaled[:3, 3] *= scale
+
+        # 2. Construct Rigid Alignment
+        T_align = np.eye(4)
+        T_align[:3, :3] = R_align
+        T_align[:3, 3] = t_align
+
+        # 3. Calculate candidate pose
+        candidate_pose = T_align @ L_scaled
+        
+        # 4. UP-VECTOR CONSISTENCY CHECK
+        # The 'Up' vector in world space is (0, 1, 0). 
+        # In the camera pose matrix, this is stored in the 2nd column (index 1).
+        up_vector_world = candidate_pose[:3, 1] 
+        
+        # If the Y-component is negative, the camera thinks 'up' is 'down'
+        if up_vector_world[1] < 0:
+            print("  -> [Geometry Warning] Detected upside-down frame, applying 180° flip.")
+            flip_R = np.array([
+                [1, 0, 0],
+                [0, -1, 0],
+                [0, 0, -1]
+            ])
+            candidate_pose[:3, :3] = candidate_pose[:3, :3] @ flip_R
+            
+        return candidate_pose
 
     def process_sequence(self, frames, masks):
         """Processes a sequence using Exact Odometry Chaining and TSDF Integration."""
