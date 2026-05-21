@@ -1,8 +1,8 @@
 import torch
 import numpy as np
 
-from utils.geometry import register_camera_poses_kabsch
-from utils.rsa import refine_depth_segments
+from .utils.geometry import register_camera_poses_kabsch
+from .utils.rsa import refine_depth_segments
 
 def align_cam_pts_irls(
         src_pts: torch.Tensor,  
