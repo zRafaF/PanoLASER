@@ -42,12 +42,12 @@ class BlockSparseSphericalTSDF:
     def integrate(self, depth_map, rgb_image, mask, pose):
         t_start = time.time()
         
-        # Ensure inputs are tensors on the right device
+        # [FIX 1]: Add .copy() to prevent PyTorch read-only warnings
         if isinstance(depth_map, np.ndarray):
-            depth_map = torch.from_numpy(depth_map).float().to(self.device)
-            mask = torch.from_numpy(mask).float().to(self.device)
-            rgb_image = torch.from_numpy(rgb_image).float().to(self.device) / 255.0
-            pose = torch.from_numpy(pose).float().to(self.device)
+            depth_map = torch.from_numpy(depth_map.copy()).float().to(self.device)
+            mask = torch.from_numpy(mask.copy()).float().to(self.device)
+            rgb_image = torch.from_numpy(rgb_image.copy()).float().to(self.device) / 255.0
+            pose = torch.from_numpy(pose.copy()).float().to(self.device)
             
         C = pose[:3, 3] # Camera position
         
@@ -59,7 +59,6 @@ class BlockSparseSphericalTSDF:
         for x in range(min_b[0], max_b[0] + 1):
             for y in range(min_b[1], max_b[1] + 1):
                 for z in range(min_b[2], max_b[2] + 1):
-                    # Prune corners of the bounding box to form a sphere
                     center = torch.tensor([x + 0.5, y + 0.5, z + 0.5], device=self.device) * self.block_size
                     if torch.norm(center - C) <= (self.max_depth + self.block_size):
                         key = (x, y, z)
@@ -69,7 +68,7 @@ class BlockSparseSphericalTSDF:
                             
         if not active_keys: return
         
-        # 2. Gather active blocks into a single batched tensor for lightning-fast math
+        # 2. Gather active blocks
         B = len(active_keys)
         N = self.voxels_per_block
         
@@ -77,11 +76,10 @@ class BlockSparseSphericalTSDF:
         old_w = torch.stack([self.blocks[k]['weights'] for k in active_keys]).view(B * N)
         old_colors = torch.stack([self.blocks[k]['colors'] for k in active_keys]).view(B * N, 3)
         
-        # Calculate true world coordinates for these active blocks on the fly
         offsets = torch.tensor(active_keys, device=self.device) * self.block_size
         world_coords = (self.block_template.unsqueeze(0) + offsets.unsqueeze(1)).view(B * N, 3)
         
-        # 3. Spherical Projection (Exactly as before, but bounded to active memory)
+        # 3. Spherical Projection
         world_homo = torch.cat([world_coords, torch.ones((B * N, 1), device=self.device)], dim=1)
         pose_inv = torch.linalg.inv(pose)
         cam_coords = (world_homo @ pose_inv.T)[:, :3]
@@ -107,9 +105,7 @@ class BlockSparseSphericalTSDF:
         # 4. TSDF Update logic
         sdf = sampled_depth - r
         
-        # Valid if: Masked, Depth > 0, Ray is within max_depth, and SDF > -margin
         valid = (sampled_mask > 0.5) & (sampled_depth > 0.1) & (r < self.max_depth) & (sdf > -self.margin)
-        
         tsdf_update = torch.clamp(sdf[valid] / self.margin, -1.0, 1.0)
         
         new_w = 1.0 
@@ -117,7 +113,7 @@ class BlockSparseSphericalTSDF:
         old_colors[valid] = (old_colors[valid] * old_w[valid].unsqueeze(1) + sampled_rgb[valid] * new_w) / (old_w[valid].unsqueeze(1) + new_w)
         old_w[valid] += new_w
         
-        # 5. Scatter the updated data back into the discrete block dictionary
+        # 5. Scatter back
         new_tsdf = old_tsdf.view(B, N)
         new_weights = old_w.view(B, N)
         new_colors = old_colors.view(B, N, 3)
@@ -129,13 +125,20 @@ class BlockSparseSphericalTSDF:
             
         print(f"      [Profile - TSDF] Processed {B} blocks ({B*N} voxels) in {time.time() - t_start:.4f} sec")
 
-    def extract_point_cloud(self, surface_threshold=0.02):
+    def extract_point_cloud(self, surface_threshold=None):
         """Extracts exactly the surfaces from all allocated blocks."""
         t_start = time.time()
         all_points, all_colors = [], []
         
+        # [FIX 2]: Default threshold to 1 voxel width if none provided
+        if surface_threshold is None:
+            surface_threshold = self.voxel_size
+            
         for k, block in self.blocks.items():
-            valid = (torch.abs(block['tsdf']) < surface_threshold) & (block['weights'] > 0)
+            # Un-normalize the TSDF back into physical meters by multiplying by the margin!
+            physical_sdf = block['tsdf'] * self.margin
+            
+            valid = (torch.abs(physical_sdf) <= surface_threshold) & (block['weights'] > 0)
             if not valid.any(): continue
             
             offset = torch.tensor(k, device=self.device) * self.block_size
