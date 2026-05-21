@@ -2,7 +2,7 @@ import torch
 import numpy as np
 
 # Correct relative paths pointing down into the utils folder
-from .utils.geometry import register_camera_poses_kabsch, apply_sim3_to_pose
+from .utils.geometry import register_camera_poses_kabsch
 from .utils.rsa import refine_depth_segments
 
 def align_cam_pts_irls(
