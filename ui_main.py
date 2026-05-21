@@ -10,6 +10,7 @@ from PIL import Image
 from inference_engine.utils.masking import get_spherical_valid_mask
 from inference_engine.utils.visualization import visualize_polar_mask, visualize_depth
 from inference_engine.inference_utils import align_cam_pts_irls
+from inference_engine.utils.geometry import unproject_equirectangular_to_points
 from pano_wrapper import PanoVGGTExtractor
 
 extractor = PanoVGGTExtractor()
@@ -57,7 +58,11 @@ def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_widt
     masked_rgb_vis = visualize_polar_mask(input_image, mask)
     
     preds = extractor.process_frame(input_image)
-    depth_map, xyz_points = preds["depth"], preds["points"]
+    depth_map = preds["depth"]
+    
+    # Apply Spherical Projection to fix the Bubble bug
+    xyz_points = unproject_equirectangular_to_points(depth_map)
+    
     depth_map[~mask] = 0.0
     depth_vis = visualize_depth(depth_map)
     
@@ -85,7 +90,10 @@ def process_sequence(image_files, zenith_limit, nadir_limit, target_width, targe
         if mask_torch is None: mask_torch = torch.from_numpy(mask)
         
         preds = extractor.process_frame(img_np)
-        curr_pts = preds["points"]
+        depth_map = preds["depth"]
+        
+        # Unproject radial depth to dense 3D points
+        curr_pts = unproject_equirectangular_to_points(depth_map)
         curr_pts_torch = torch.from_numpy(curr_pts)
         
         if i == 0:
@@ -103,7 +111,7 @@ def process_sequence(image_files, zenith_limit, nadir_limit, target_width, targe
             
             # 2. Rigid Geometric Alignment (ICP)
             reg = o3d.pipelines.registration.registration_icp(
-                curr_pcd, global_pcd, max_correspondence_distance=1.0,
+                curr_pcd, global_pcd, max_correspondence_distance=2.0,
                 estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint()
             )
             
