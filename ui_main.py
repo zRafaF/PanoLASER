@@ -139,9 +139,16 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
                     download_single = gr.File(label="💾 Download Frame .ply")
                 
                 with gr.Tab("2. Multi-Frame 4D Stitching"):
-                    dir_input = gr.Textbox(label="Server Directory Path", placeholder="/absolute/path/to/images")
+                    # Use FileExplorer for an interactive directory picker
+                    # root_dir="." makes it relative to where you launch the script
+                    dir_input = gr.FileExplorer(
+                        label="Select Directory on Server", 
+                        root_dir=".", 
+                        glob="**/",  # Shows directories
+                        file_count="single"
+                    )
                     decimation_input = gr.Number(value=1, label="Decimation (Skip rate)", minimum=1, step=1)
-                    run_seq_btn = gr.Button("Align & Stitch Directory", variant="primary")
+                    run_seq_btn = gr.Button("Align & Stitch Selected Directory", variant="primary")
                     output_3d_seq = gr.Plot(label="Global Stitched Map")
                     download_seq = gr.File(label="💾 Download Global .ply")
 
