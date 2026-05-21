@@ -57,14 +57,17 @@ class PanoStreamingEngine:
             
         return candidate_pose
 
-    def _build_global_pcd(self, raw_pts, rgb, mask, global_pose, scale=1.0):
-        """Filters invalid pixels, applies scale, and transforms into global space."""
-        valid = mask.astype(bool)
-        # 1. Scale the local geometry points
+    def _build_global_pcd(self, raw_pts, rgb, mask, global_pose, scale=1.0, max_depth=10.0):
+        """Filters invalid pixels, applies scale, cleans outliers, and transforms to global space."""
+        # 1. Depth Confidence Thresholding (Heuristic)
+        # Calculate distances from the origin (camera center)
+        distances = np.linalg.norm(raw_pts, axis=1)
+        valid = mask.astype(bool) & (distances < max_depth)
+        
         pts = raw_pts[valid] * scale
         colors = rgb[valid] / 255.0
         
-        # 2. Transform to global space using the strict SE(3) pose
+        # 2. Transform to global space
         ones = np.ones((pts.shape[0], 1))
         pts_homo = np.hstack([pts, ones])
         pts_global = (global_pose @ pts_homo.T).T[:, :3]
@@ -72,6 +75,12 @@ class PanoStreamingEngine:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts_global)
         pcd.colors = o3d.utility.Vector3dVector(colors)
+        
+        # 3. Statistical Outlier Removal
+        # nb_neighbors: how many neighbors to analyze
+        # std_ratio: lower means more aggressive filtering
+        pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        
         return pcd
 
     def process_sequence(self, frames, masks):
