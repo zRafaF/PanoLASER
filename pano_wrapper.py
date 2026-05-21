@@ -3,7 +3,6 @@ import sys
 import torch
 import numpy as np
 from omegaconf import OmegaConf
-import torchvision.transforms.functional as TF
 
 # Ensure the PanoVGGT submodule is in the path
 sys.path.append(os.path.abspath("./PanoVGGT"))
@@ -50,11 +49,11 @@ class PanoVGGTExtractor:
     @torch.no_grad()
     def process_frame(self, rgb_image: np.ndarray):
         """Processes a single frame (Used in UI Tab 1)"""
+        # Preprocess: [0, 255] -> [0, 1]
         img_tensor = torch.from_numpy(rgb_image).float() / 255.0
         img_tensor = img_tensor.permute(2, 0, 1)
         
-        # ImageNet Normalization required by DINOv2
-        img_tensor = TF.normalize(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # NOTE: Removed TF.normalize! PanoVGGT expects raw [0,1] tensors.
         
         img_tensor = img_tensor.unsqueeze(0).unsqueeze(0).to(self.device)
         

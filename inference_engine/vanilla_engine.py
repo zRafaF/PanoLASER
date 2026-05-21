@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import torchvision.transforms.functional as TF
 from .utils.geometry import unproject_equirectangular_to_points
 
 class PanoVanillaEngine(nn.Module):
@@ -14,9 +13,9 @@ class PanoVanillaEngine(nn.Module):
     def forward(self, rgb_images_list):
         tensors = []
         for rgb_image in rgb_images_list:
+            # Preprocess: [0, 255] -> [0, 1]
             t = torch.from_numpy(rgb_image).float() / 255.0
             t = t.permute(2, 0, 1)
-            t = TF.normalize(t, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             tensors.append(t)
             
         seq_tensor = torch.stack(tensors, dim=0).unsqueeze(0).to(self.device)
@@ -28,7 +27,6 @@ class PanoVanillaEngine(nn.Module):
         depths = preds["depth"].squeeze(0).cpu().float().numpy()
         poses = preds["camera_poses"].squeeze(0).cpu().float().numpy()
 
-        # FIX: np.squeeze(d) removes any stray [1, H, W] channel dimensions preventing the unpacking error
         pts_list = [unproject_equirectangular_to_points(np.squeeze(d)) for d in depths]
 
         return {
