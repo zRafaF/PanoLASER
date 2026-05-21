@@ -77,8 +77,10 @@ class PanoStreamingEngine:
     def process_sequence(self, frames, masks):
         """Processes a sequence using Exact Odometry Chaining & IRLS Scale Alignment."""
         self.reset()
+        num_frames = len(frames)
         
-        for i in range(0, len(frames) - 1, self.window_size - self.overlap):
+        # We loop until we cannot form a full window anymore
+        for i in range(0, num_frames - self.window_size + 1, self.window_size - self.overlap):
             window_frames = frames[i : i + self.window_size]
             window_masks = masks[i : i + self.window_size]
             
@@ -92,7 +94,6 @@ class PanoStreamingEngine:
                     pcd = self._build_global_pcd(pts_list[j], window_frames[j], window_masks[j], poses[j])
                     self.global_pcd += pcd
                 
-                # CRITICAL: Estimate normals for the global map so PointToPlane ICP works
                 self.global_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
                 
                 self.prev_overlap_raw_pts = pts_list[-self.overlap:]
@@ -100,35 +101,30 @@ class PanoStreamingEngine:
                 self.is_first_window = False
                 
             else:
-                curr_overlap_raw_pts = pts_list[:self.overlap]
-                
                 # 1. IRLS Scale Drift Correction
+                # Use .copy() to ensure the array is writable for PyTorch
                 scale_diff = align_cam_pts_irls(
-                    torch.from_numpy(curr_overlap_raw_pts[0]), 
-                    torch.from_numpy(self.prev_overlap_raw_pts[0]), 
-                    torch.from_numpy(window_masks[0])
+                    torch.from_numpy(pts_list[0].copy()), 
+                    torch.from_numpy(self.prev_overlap_raw_pts[0].copy()), 
+                    torch.from_numpy(window_masks[0].copy())
                 )
                 
                 # 2. Point-to-Plane ICP
+                # j starts from overlap, not 0, to avoid re-processing the overlap frame
                 for j in range(self.overlap, self.window_size):
                     pcd = self._build_global_pcd(pts_list[j], window_frames[j], window_masks[j], poses[j], scale=scale_diff)
-                    
-                    # Estimate normals for the incoming PCD
                     pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
                     
-                    # ICP Point-to-Plane registration
                     reg = o3d.pipelines.registration.registration_icp(
                         pcd, self.global_pcd, 2.0, np.eye(4),
                         o3d.pipelines.registration.TransformationEstimationPointToPlane()
                     )
                     pcd.transform(reg.transformation)
                     self.global_pcd += pcd
-                    
-                    # Re-estimate global normals after adding new points
                     self.global_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
                 
                 self.prev_overlap_raw_pts = pts_list[-self.overlap:]
 
-        self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.05)
+        self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.02)
         print("[Streaming Engine] Sequence processing complete.")
         return self.global_pcd
