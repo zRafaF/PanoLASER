@@ -81,16 +81,25 @@ def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_widt
     pcd = get_o3d_pcd(xyz_points, input_image, mask)
     return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), create_plotly_figure_from_pcd(pcd), save_pcd_to_ply(pcd, "single_frame")
 
-def process_sequence_ui(image_files, zenith_limit, nadir_limit, target_width, target_height):
-    if not image_files or len(image_files) < 2:
-        raise gr.Error("Please upload at least 2 images.")
+def process_sequence_ui(directory_path, decimation, zenith_limit, nadir_limit, target_width, target_height):
+    if not directory_path or not os.path.isdir(directory_path):
+        raise gr.Error("Invalid directory path provided.")
     
-    image_files = sorted(image_files, key=lambda x: x.name)
+    valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
+    image_files = sorted([os.path.join(directory_path, f) for f in os.listdir(directory_path) 
+                          if f.lower().endswith(valid_exts)])
+    
+    # Apply decimation (e.g., every 2nd or 3rd image)
+    step = int(decimation)
+    image_files = image_files[::step]
+    
+    if len(image_files) < 2:
+        raise gr.Error(f"Found only {len(image_files)} valid images. Please ensure directory contains at least 2 images.")
     
     frames = []
     masks = []
-    for f in image_files:
-        img_pil = Image.open(f.name).convert("RGB").resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
+    for f_path in image_files:
+        img_pil = Image.open(f_path).convert("RGB").resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
         img_np = np.array(img_pil)
         frames.append(img_np)
         mask = get_spherical_valid_mask(img_np.shape[0], img_np.shape[1], zenith_deg=zenith_limit, nadir_deg=nadir_limit)
@@ -130,8 +139,9 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
                     download_single = gr.File(label="💾 Download Frame .ply")
                 
                 with gr.Tab("2. Multi-Frame 4D Stitching"):
-                    input_seq = gr.File(label="Upload Image Sequence", file_count="multiple", file_types=["image"])
-                    run_seq_btn = gr.Button("Align & Stitch Sequence", variant="primary")
+                    dir_input = gr.Textbox(label="Server Directory Path", placeholder="/absolute/path/to/images")
+                    decimation_input = gr.Number(value=1, label="Decimation (Skip rate)", minimum=1, step=1)
+                    run_seq_btn = gr.Button("Align & Stitch Directory", variant="primary")
                     output_3d_seq = gr.Plot(label="Global Stitched Map")
                     download_seq = gr.File(label="💾 Download Global .ply")
 
@@ -150,7 +160,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
     
     run_seq_btn.click(
         fn=process_sequence_ui,
-        inputs=[input_seq, zenith_slider, nadir_slider, target_width, target_height],
+        inputs=[dir_input, decimation_input, zenith_slider, nadir_slider, target_width, target_height],
         outputs=[output_3d_seq, download_seq],
         api_name=False
     )
