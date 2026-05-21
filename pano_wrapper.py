@@ -43,35 +43,30 @@ class PanoVGGTExtractor:
                 break
                 
         sd = {(k[7:] if k.startswith("module.") else k): v for k, v in ckpt.items()}
-        missing, unexpected = self.model.load_state_dict(sd, strict=False)
+        self.model.load_state_dict(sd, strict=False)
         self.model.eval()
         print("✅ PanoVGGT model loaded successfully.")
 
     @torch.no_grad()
-    def process_window(self, rgb_images_list: list):
-        """
-        Runs a temporal sequence of RGB images through PanoVGGT to extract 
-        joint geometry and relative camera poses.
-        """
-        tensors = []
-        for rgb_image in rgb_images_list:
-            t = torch.from_numpy(rgb_image).float() / 255.0
-            t = t.permute(2, 0, 1)
-            t = TF.normalize(t, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            tensors.append(t)
-            
-        # Stack to (N, C, H, W) and add Batch dimension -> (1, N, C, H, W)
-        seq_tensor = torch.stack(tensors, dim=0).unsqueeze(0).to(self.device)
+    def process_frame(self, rgb_image: np.ndarray):
+        """Processes a single frame (Used in UI Tab 1)"""
+        img_tensor = torch.from_numpy(rgb_image).float() / 255.0
+        img_tensor = img_tensor.permute(2, 0, 1)
+        
+        # ImageNet Normalization required by DINOv2
+        img_tensor = TF.normalize(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        
+        img_tensor = img_tensor.unsqueeze(0).unsqueeze(0).to(self.device)
         
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
         with torch.amp.autocast("cuda", dtype=dtype):
-            preds = self.model(seq_tensor)
+            preds = self.model(img_tensor)
             
-        # Extract sequences
-        depth_out = preds["depth"].squeeze(0).cpu().float().numpy()      # (N, H, W)
-        poses_out = preds["camera_poses"].squeeze(0).cpu().float().numpy() # (N, 4, 4)
+        if "depth" in preds and preds["depth"] is not None:
+            depth_out = preds["depth"].squeeze().cpu().float().numpy()
+        elif "local_points" in preds and preds["local_points"] is not None:
+            depth_out = torch.norm(preds["local_points"], dim=-1).squeeze().cpu().float().numpy()
+        else:
+            raise RuntimeError("Model output did not contain depth")
 
-        return {
-            "depths": depth_out,
-            "poses": poses_out
-        }
+        return {"depth": depth_out}
