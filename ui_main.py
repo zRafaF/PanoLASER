@@ -81,31 +81,12 @@ def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_widt
     pcd = get_o3d_pcd(xyz_points, input_image, mask)
     return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), create_plotly_figure_from_pcd(pcd), save_pcd_to_ply(pcd, "single_frame")
 
-def process_sequence_ui(dir_selection, decimation, zenith_limit, nadir_limit, target_width, target_height):
-    # 1. Debug: print to server console to see what Gradio actually passes
-    print(f"DEBUG: dir_selection received: {dir_selection}")
-    
-    if not dir_selection:
-        raise gr.Error("No path selected. Please click on a folder in the explorer.")
-
-    # 2. Get the path. If it's a list, take the first item.
-    selected_item = dir_selection[0] if isinstance(dir_selection, list) else dir_selection
-    
-    # 3. Determine if the selected item is a file or a directory
-    full_path = os.path.abspath(os.path.join(".", selected_item))
-    
-    # If a file was selected, get its parent directory
-    if os.path.isfile(full_path):
-        directory_path = os.path.dirname(full_path)
-    else:
-        directory_path = full_path
-
+def process_sequence_ui(directory_path, decimation, zenith_limit, nadir_limit, target_width, target_height):
+    # Ensure path is cleaned
+    directory_path = directory_path.strip()
     if not os.path.isdir(directory_path):
-        raise gr.Error(f"Could not resolve directory: {directory_path}")
-        
-    print(f"Processing directory: {directory_path}")
+        raise gr.Error(f"Invalid directory path: {directory_path}")
     
-    # ... proceed with existing file loading logic (using directory_path)
     valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
     image_files = sorted([os.path.join(directory_path, f) for f in os.listdir(directory_path) 
                           if f.lower().endswith(valid_exts)])
@@ -115,7 +96,7 @@ def process_sequence_ui(dir_selection, decimation, zenith_limit, nadir_limit, ta
     image_files = image_files[::step]
     
     if len(image_files) < 2:
-        raise gr.Error(f"Found only {len(image_files)} valid images in {full_path}. Need at least 2.")
+        raise gr.Error(f"Found only {len(image_files)} valid images in {directory_path}. Need at least 2.")
     
     frames = []
     masks = []
@@ -160,16 +141,9 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
                     download_single = gr.File(label="💾 Download Frame .ply")
                 
                 with gr.Tab("2. Multi-Frame 4D Stitching"):
-                    # Use FileExplorer for an interactive directory picker
-                    # root_dir="." makes it relative to where you launch the script
-                    dir_input = gr.FileExplorer(
-                        label="Select Directory on Server", 
-                        root_dir=".", 
-                        glob="**/", 
-                        file_count="multiple"  # This enables directory selection
-                    )
+                    dir_input = gr.Textbox(label="Enter Directory Path on Server", placeholder="/root/PanoLASER/examples")
                     decimation_input = gr.Number(value=1, label="Decimation (Skip rate)", minimum=1, step=1)
-                    run_seq_btn = gr.Button("Align & Stitch Selected Directory", variant="primary")
+                    run_seq_btn = gr.Button("Align & Stitch Directory", variant="primary")
                     output_3d_seq = gr.Plot(label="Global Stitched Map")
                     download_seq = gr.File(label="💾 Download Global .ply")
 
