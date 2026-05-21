@@ -144,8 +144,8 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
                     dir_input = gr.FileExplorer(
                         label="Select Directory on Server", 
                         root_dir=".", 
-                        glob="**/",  # Shows directories
-                        file_count="single"
+                        glob="**/", 
+                        file_count="multiple"  # This enables directory selection
                     )
                     decimation_input = gr.Number(value=1, label="Decimation (Skip rate)", minimum=1, step=1)
                     run_seq_btn = gr.Button("Align & Stitch Selected Directory", variant="primary")
