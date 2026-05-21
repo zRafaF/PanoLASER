@@ -20,10 +20,9 @@ class PanoStreamingEngine:
         
     def reset(self):
         """Clears the temporal memory and initializes a new TSDF Volume."""
-        # Initialize a 10m x 10m x 4m room volume centered around the camera
-        # At 2cm resolution, this is highly detailed and fits perfectly in VRAM.
         vol_bounds = [[-5.0, 5.0], [-2.0, 2.0], [-5.0, 5.0]]
-        self.tsdf = SphericalTSDFVolume(vol_bounds=vol_bounds, voxel_size=0.02, margin=0.15, device=self.device)
+        # TIGHTENED MARGIN: 0.08 keeps the integration band tight to the real surface
+        self.tsdf = SphericalTSDFVolume(vol_bounds=vol_bounds, voxel_size=0.02, margin=0.08, device=self.device)
         
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
@@ -49,8 +48,8 @@ class PanoStreamingEngine:
             poses = preds["poses"]
             
             if self.is_first_window:
+                self.prev_overlap_global_poses = []
                 for j in range(self.window_size):
-                    # Recover the (H, W) depth map from the unprojected 3D points
                     depth_map = np.linalg.norm(pts_list[j], axis=-1)
                     
                     self.tsdf.integrate(
@@ -59,37 +58,55 @@ class PanoStreamingEngine:
                         mask=window_masks[j], 
                         pose=poses[j]
                     )
+                    # For the first window, local poses are global poses
+                    self.prev_overlap_global_poses.append(poses[j])
                 
                 self.prev_overlap_raw_pts = pts_list[-self.overlap:]
-                self.prev_overlap_global_poses = list(poses[-self.overlap:])
+                self.prev_overlap_global_poses = self.prev_overlap_global_poses[-self.overlap:]
                 self.is_first_window = False
                 
             else:
                 t_align_start = time.time()
+                # 1. Calculate Scale Drift
                 scale_diff = align_cam_pts_irls(
                     torch.from_numpy(pts_list[0].copy()), 
                     torch.from_numpy(self.prev_overlap_raw_pts[0].copy()), 
                     torch.from_numpy(window_masks[0].copy())
                 )
-                print(f"  [Profile] IRLS Alignment took {time.time() - t_align_start:.4f} sec")
                 
-                for j in range(self.overlap, self.window_size):
-                    # Recover depth map here as well
-                    depth_map = np.linalg.norm(pts_list[j], axis=-1)
+                # 2. Rigid Odometry Stitching (Kabsch Alignment)
+                # Map the current local overlap to the previous global overlap
+                src_cam_np = np.stack(poses[:self.overlap])
+                tgt_cam_np = np.stack(self.prev_overlap_global_poses)
+                
+                R_align, t_align = register_camera_poses_kabsch(src_cam_np, tgt_cam_np, scale=scale_diff)
+                print(f"  [Profile] Sim3 Kabsch Alignment took {time.time() - t_align_start:.4f} sec")
+                
+                new_global_poses = []
+                for j in range(self.window_size):
+                    # Transform the local network pose into the unified global map space
+                    global_pose = self._apply_sim3_to_pose(poses[j], R_align, t_align, scale_diff)
+                    new_global_poses.append(global_pose)
                     
-                    self.tsdf.integrate(
-                        depth_map=depth_map, 
-                        rgb_image=window_frames[j], 
-                        mask=window_masks[j], 
-                        pose=poses[j],
-                        scale=scale_diff
-                    )
+                    # Only map the NEW frames (ignore the overlap ones we already mapped)
+                    if j >= self.overlap:
+                        depth_map = np.linalg.norm(pts_list[j], axis=-1)
+                        
+                        self.tsdf.integrate(
+                            depth_map=depth_map, 
+                            rgb_image=window_frames[j], 
+                            mask=window_masks[j], 
+                            pose=global_pose,  # Use the ALIGNED pose!
+                            scale=scale_diff
+                        )
                 
+                # Save the end of this newly aligned window to be the target for the next one
                 self.prev_overlap_raw_pts = pts_list[-self.overlap:]
+                self.prev_overlap_global_poses = new_global_poses[-self.overlap:]
 
         print("[Streaming Engine] Sequence processing complete.")
         
-        # Extract the final point cloud from the TSDF grid exactly once at the end
-        final_pcd = self.tsdf.extract_point_cloud(surface_threshold=0.15)
+        # 3. RAZOR SHARP EXTRACTION: Only extract voxels within 2cm of the exact surface crossing
+        final_pcd = self.tsdf.extract_point_cloud(surface_threshold=0.02)
         
         return final_pcd
