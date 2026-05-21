@@ -25,20 +25,37 @@ class PanoStreamingEngine:
 
     def _apply_sim3_to_pose(self, local_pose, R_align, t_align, scale):
         """
-        Applies a Sim(3) transformation to a local SE(3) pose.
-        Produces a mathematically strict, un-sheared SE(3) global pose.
+        Applies Sim(3) with an Uprightness Constraint to prevent floor/ceiling flipping.
         """
-        # 1. Scale ONLY the translation component of the local pose
+        # 1. Scale ONLY the translation component
         L_scaled = local_pose.copy()
         L_scaled[:3, 3] *= scale
 
-        # 2. Create the strict rigid alignment matrix
+        # 2. Construct Rigid Alignment
         T_align = np.eye(4)
         T_align[:3, :3] = R_align
         T_align[:3, 3] = t_align
 
-        # 3. Chain them (Avoids the rotation scaling bug in the original LASER code)
-        return T_align @ L_scaled
+        # 3. Calculate candidate pose
+        candidate_pose = T_align @ L_scaled
+        
+        # 4. UP-VECTOR CONSISTENCY CHECK
+        # The 'Up' vector in world space is (0, 1, 0). 
+        # In the camera pose matrix, this is stored in the 2nd column (index 1) of the rotation part.
+        up_vector_world = candidate_pose[:3, 1] 
+        
+        # If the Y-component is negative, the camera thinks 'up' is 'down'
+        if up_vector_world[1] < 0:
+            print("  -> [Geometry Warning] Detected upside-down frame, applying 180° flip.")
+            # Apply a 180-degree rotation around the X-axis to flip the frame
+            flip_R = np.array([
+                [1, 0, 0],
+                [0, -1, 0],
+                [0, 0, -1]
+            ])
+            candidate_pose[:3, :3] = candidate_pose[:3, :3] @ flip_R
+            
+        return candidate_pose
 
     def _build_global_pcd(self, raw_pts, rgb, mask, global_pose, scale=1.0):
         """Filters invalid pixels, applies scale, and transforms into global space."""
