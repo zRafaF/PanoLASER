@@ -60,8 +60,8 @@ class PanoStreamingEngine:
     def _build_global_pcd(self, raw_pts, rgb, mask, global_pose, scale=1.0, max_depth=10.0):
         """Filters invalid pixels, applies scale, cleans outliers, and transforms to global space."""
         # 1. Depth Confidence Thresholding (Heuristic)
-        # Calculate distances from the origin (camera center)
-        distances = np.linalg.norm(raw_pts, axis=1)
+        # raw_pts is shape (H, W, 3), so we take the norm over the last axis to get (H, W)
+        distances = np.linalg.norm(raw_pts, axis=-1)
         valid = mask.astype(bool) & (distances < max_depth)
         
         pts = raw_pts[valid] * scale
@@ -77,8 +77,7 @@ class PanoStreamingEngine:
         pcd.colors = o3d.utility.Vector3dVector(colors)
         
         # 3. Statistical Outlier Removal
-        # nb_neighbors: how many neighbors to analyze
-        # std_ratio: lower means more aggressive filtering
+        # This will clean up floating artifacts before integration
         pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         
         return pcd
