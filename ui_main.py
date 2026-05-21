@@ -6,6 +6,7 @@ import tempfile
 import os
 import torch
 from PIL import Image
+import copy
 
 from inference_engine.utils.masking import get_spherical_valid_mask
 from inference_engine.utils.visualization import visualize_polar_mask, visualize_depth
@@ -69,7 +70,8 @@ def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_widt
     pcd = get_o3d_pcd(xyz_points, input_image, mask)
     return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), create_plotly_figure_from_pcd(pcd), save_pcd_to_ply(pcd)
 
-# --- Pipeline 2: Multi-Frame Sequence Alignment ---
+
+# --- Pipeline 2: Multi-Frame Sequence Alignment (Upgraded) ---
 def process_sequence(image_files, zenith_limit, nadir_limit, target_width, target_height):
     if not image_files or len(image_files) < 2:
         raise gr.Error("Please upload at least 2 images to test sequence alignment.")
@@ -79,7 +81,11 @@ def process_sequence(image_files, zenith_limit, nadir_limit, target_width, targe
     
     global_pcd = o3d.geometry.PointCloud()
     prev_pts_torch = None
+    prev_pcd = None
     mask_torch = None
+    
+    # Track the global camera trajectory using matrix multiplication
+    current_global_transform = np.eye(4)
     
     for i, file in enumerate(image_files):
         img_pil = Image.open(file.name).convert("RGB").resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
@@ -92,39 +98,50 @@ def process_sequence(image_files, zenith_limit, nadir_limit, target_width, targe
         preds = extractor.process_frame(img_np)
         depth_map = preds["depth"]
         
-        # Unproject radial depth to dense 3D points
         curr_pts = unproject_equirectangular_to_points(depth_map)
         curr_pts_torch = torch.from_numpy(curr_pts)
         
         if i == 0:
-            # First frame forms the origin of the global map
             global_pcd = get_o3d_pcd(curr_pts, img_np, mask)
+            # CRITICAL: Estimate surface normals so Point-to-Plane ICP can lock onto walls
+            global_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=1.0, max_nn=30))
+            
+            prev_pcd = global_pcd
             prev_pts_torch = curr_pts_torch
         else:
-            # 1. Calculate Scale Drift using our new IRLS Engine
+            # 1. Calculate and Apply Scale Drift Correction via IRLS
             scale_diff = align_cam_pts_irls(curr_pts_torch, prev_pts_torch, mask_torch)
             print(f"[Alignment] Frame {i} -> Scale Correction: {scale_diff:.4f}")
             
-            # Apply scale correction
             curr_pts_scaled = curr_pts * scale_diff
             curr_pcd = get_o3d_pcd(curr_pts_scaled, img_np, mask)
+            curr_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=1.0, max_nn=30))
             
-            # 2. Rigid Geometric Alignment (ICP)
+            # 2. Frame-to-Frame Rigid Geometric Alignment
+            # Align the CURRENT frame strictly to the PREVIOUS frame using planar surfaces
             reg = o3d.pipelines.registration.registration_icp(
-                curr_pcd, global_pcd, max_correspondence_distance=2.0,
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint()
+                curr_pcd, prev_pcd, max_correspondence_distance=2.0,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane()
             )
             
-            curr_pcd.transform(reg.transformation)
-            global_pcd += curr_pcd # Stitch into global map
+            # 3. Odometry Chaining
+            # Multiply the relative movement by the global trajectory 
+            current_global_transform = current_global_transform @ reg.transformation
             
+            # Create a copy to push into the global map so we don't mess up our tracking states
+            curr_pcd_global = copy.deepcopy(curr_pcd)
+            curr_pcd_global.transform(current_global_transform)
+            
+            global_pcd += curr_pcd_global 
+            
+            # Update the tracking variables for the next iteration
+            prev_pcd = curr_pcd
             prev_pts_torch = torch.from_numpy(curr_pts_scaled)
 
-    # Downsample final map to clean up overlapping geometry
+    # Downsample final map to clean up overlapping geometry and boost rendering speed
     global_pcd = global_pcd.voxel_down_sample(voxel_size=0.05)
     
     return create_plotly_figure_from_pcd(global_pcd), save_pcd_to_ply(global_pcd, "global_stitched_map")
-
 
 # --- Gradio UI Layout ---
 with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine") as demo:
