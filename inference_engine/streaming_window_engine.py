@@ -20,8 +20,9 @@ class PanoStreamingEngine:
         
     def reset(self):
         """Clears the temporal memory and initializes a new TSDF Volume."""
-        vol_bounds = [[-5.0, 5.0], [-2.0, 2.0], [-5.0, 5.0]]
-        # TIGHTENED MARGIN: 0.08 keeps the integration band tight to the real surface
+        # [FIX 1]: Expand the bounds massively to prevent clipping. 
+        # Now a 20m x 8m x 20m tracking volume.
+        vol_bounds = [[-10.0, 10.0], [-4.0, 4.0], [-10.0, 10.0]]
         self.tsdf = SphericalTSDFVolume(vol_bounds=vol_bounds, voxel_size=0.02, margin=0.08, device=self.device)
         
         self.prev_overlap_raw_pts = []
@@ -82,17 +83,24 @@ class PanoStreamingEngine:
             
             if self.is_first_window:
                 self.prev_overlap_global_poses = []
+                
+                # [FIX 2]: Calculate the inverse of the first pose to act as our leveling anchor
+                self.world_anchor = np.linalg.inv(poses[0])
+                
                 for j in range(self.window_size):
+                    # Map the raw network pose to our perfectly level origin
+                    aligned_pose = self.world_anchor @ poses[j]
+                    
                     depth_map = np.linalg.norm(pts_list[j], axis=-1)
                     
                     self.tsdf.integrate(
                         depth_map=depth_map, 
                         rgb_image=window_frames[j], 
                         mask=window_masks[j], 
-                        pose=poses[j]
+                        pose=aligned_pose  # Use the perfectly leveled pose!
                     )
-                    # For the first window, local poses are global poses
-                    self.prev_overlap_global_poses.append(poses[j])
+                    # Save the aligned poses so subsequent windows stitch to the leveled map
+                    self.prev_overlap_global_poses.append(aligned_pose)
                 
                 self.prev_overlap_raw_pts = pts_list[-self.overlap:]
                 self.prev_overlap_global_poses = self.prev_overlap_global_poses[-self.overlap:]
