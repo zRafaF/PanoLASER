@@ -82,23 +82,32 @@ def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_widt
     return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), create_plotly_figure_from_pcd(pcd), save_pcd_to_ply(pcd, "single_frame")
 
 def process_sequence_ui(dir_selection, decimation, zenith_limit, nadir_limit, target_width, target_height):
-    # 1. Extract path from selection
+    # 1. Debug: print to server console to see what Gradio actually passes
+    print(f"DEBUG: dir_selection received: {dir_selection}")
+    
     if not dir_selection:
-        raise gr.Error("No directory selected.")
+        raise gr.Error("No path selected. Please click on a folder in the explorer.")
+
+    # 2. Get the path. If it's a list, take the first item.
+    selected_item = dir_selection[0] if isinstance(dir_selection, list) else dir_selection
     
-    # If file_count="multiple", dir_selection is a list. Get the first element.
-    selected_path = dir_selection[0] if isinstance(dir_selection, list) else dir_selection
+    # 3. Determine if the selected item is a file or a directory
+    full_path = os.path.abspath(os.path.join(".", selected_item))
     
-    # 2. Make it absolute based on your root_dir (which is '.')
-    # This ensures it works regardless of where the script was launched
-    full_path = os.path.abspath(os.path.join(".", selected_path))
+    # If a file was selected, get its parent directory
+    if os.path.isfile(full_path):
+        directory_path = os.path.dirname(full_path)
+    else:
+        directory_path = full_path
+
+    if not os.path.isdir(directory_path):
+        raise gr.Error(f"Could not resolve directory: {directory_path}")
+        
+    print(f"Processing directory: {directory_path}")
     
-    if not os.path.isdir(full_path):
-        raise gr.Error(f"Invalid directory path: {full_path}")
-    
-    # 3. Proceed with file loading using the full absolute path
+    # ... proceed with existing file loading logic (using directory_path)
     valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
-    image_files = sorted([os.path.join(full_path, f) for f in os.listdir(full_path) 
+    image_files = sorted([os.path.join(directory_path, f) for f in os.listdir(directory_path) 
                           if f.lower().endswith(valid_exts)])
     
     # Apply decimation
