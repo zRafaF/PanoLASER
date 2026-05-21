@@ -18,6 +18,21 @@ git clone --recurse-submodules https://github.com/zRafaF/PanoLASER
 cd PanoLASER
 ```
 
+#### 1.a Optional: If you don't have, install pip
+
+For Ubuntu/Debian:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+Then
+
+```bash
+source $HOME/.local/bin/env
+```
+
+> For more info please refer to the official installation guide: https://docs.astral.sh/uv/getting-started/installation/
+
 ### 2. Sync the Environment
 
 Run the following command. `uv` will automatically pull Python 3.11 (the required version for maximum framework stability), create an isolated internal environment, and resolve/install all required dependencies (including the specific PyTorch CUDA 12.4 wheels) exactly as defined in the configuration:
@@ -26,12 +41,12 @@ Run the following command. `uv` will automatically pull Python 3.11 (the require
 uv sync
 ```
 
-**NOTE**
+<!-- **NOTE**
 To run in instances that already have cuda torch and some other dependencies you can use the following command.
 
 ```bash
 uv pip install --system -e .
-```
+``` -->
 
 ### 3. Compile Cython Modules
 

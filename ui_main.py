@@ -8,19 +8,16 @@ from PIL import Image
 
 from inference_engine.utils.masking import get_spherical_valid_mask
 from inference_engine.utils.visualization import visualize_polar_mask, visualize_depth
+from inference_engine.utils.geometry import unproject_equirectangular_to_points
 from pano_wrapper import PanoVGGTExtractor
 
 # Initialize the model wrapper globally
 extractor = PanoVGGTExtractor()
 
 def create_point_cloud_ply(xyz_points, rgb_image, mask):
-    """Creates the full-density PLY file for local visualization."""
-    # Convert mask to boolean
     valid_mask = mask.astype(bool)
-    
-    # Strictly align the 2D mask with the 3D points
-    points_filtered = xyz_points[valid_mask]  # (N_valid, 3)
-    colors_filtered = rgb_image[valid_mask] / 255.0  # (N_valid, 3)
+    points_filtered = xyz_points[valid_mask]
+    colors_filtered = rgb_image[valid_mask] / 255.0
     
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_filtered)
@@ -32,14 +29,10 @@ def create_point_cloud_ply(xyz_points, rgb_image, mask):
     return ply_path
 
 def create_plotly_figure(xyz_points, rgb_image, mask, max_points=150000):
-    """Creates a subsampled Plotly figure for robust in-browser rendering."""
     valid_mask = mask.astype(bool)
-    
-    # Filter points and colors
     points_filtered = xyz_points[valid_mask]
     colors_filtered = rgb_image[valid_mask]
     
-    # Subsample to avoid browser crashes
     if len(points_filtered) > max_points:
         indices = np.random.choice(len(points_filtered), max_points, replace=False)
         points_filtered = points_filtered[indices]
@@ -82,30 +75,27 @@ def process_pipeline(input_image_pil, zenith_limit, nadir_limit, target_width, t
     if input_image_pil is None:
         return None, None, None, None
     
-    # 1. Resize image
     input_image_pil = input_image_pil.resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
     input_image = np.array(input_image_pil)
     H, W = input_image.shape[:2]
     
-    # 2. Masking
     mask = get_spherical_valid_mask(H, W, zenith_deg=zenith_limit, nadir_deg=nadir_limit)
     masked_rgb_vis = visualize_polar_mask(input_image, mask)
     
-    # 3. Inference
+    # 1. Run inference to get the pure depth map
     predictions = extractor.process_frame(input_image)
     depth_map = predictions["depth"]
-    xyz_points = predictions["points"]  # Native 3D Output
     
-    # Apply mask to depth for 2D visualization
+    # 2. RESTORED: Unproject the depth map mathematically into 3D points
+    xyz_points = unproject_equirectangular_to_points(depth_map)
+    
     depth_map[~mask] = 0.0
     depth_vis = visualize_depth(depth_map)
     
-    # 4. Generate 3D point cloud & plotly figure
     plotly_fig = create_plotly_figure(xyz_points, input_image, mask)
     ply_file_path = create_point_cloud_ply(xyz_points, input_image, mask)
     
     return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), plotly_fig, ply_file_path
-
 
 # --- Gradio UI Layout ---
 with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine") as demo:
@@ -141,31 +131,26 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
             
             download_ply = gr.File(label="💾 Download Full Dense Point Cloud (.ply)")
 
-    # --- Event Wiring ---
     target_width.release(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
     )
-    
     target_height.release(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'h'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
     )
-    
     link_ratio.change(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
     )
-    
     step_size.change(
         fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
         inputs=[target_width, target_height, step_size, link_ratio],
         outputs=[target_width, target_height, ratio_info]
     )
-
     run_btn.click(
         fn=process_pipeline,
         inputs=[input_img, zenith_slider, nadir_slider, target_width, target_height],
