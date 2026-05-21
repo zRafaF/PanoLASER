@@ -9,7 +9,7 @@ from PIL import Image
 
 from inference_engine.utils.masking import get_spherical_valid_mask
 from inference_engine.utils.visualization import visualize_polar_mask, visualize_depth
-from inference_engine.utils.inference_utils import align_cam_pts_irls
+from inference_engine.inference_utils import align_cam_pts_irls
 from pano_wrapper import PanoVGGTExtractor
 
 extractor = PanoVGGTExtractor()
