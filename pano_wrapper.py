@@ -3,6 +3,7 @@ import sys
 import torch
 import numpy as np
 from omegaconf import OmegaConf
+import torchvision.transforms.functional as TF
 
 # Ensure the PanoVGGT submodule is in the path
 sys.path.append(os.path.abspath("./PanoVGGT"))
