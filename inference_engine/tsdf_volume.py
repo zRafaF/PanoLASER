@@ -4,44 +4,42 @@ import numpy as np
 import open3d as o3d
 import time
 
-class SphericalTSDFVolume:
-    def __init__(self, vol_bounds, voxel_size=0.02, margin=0.1, device="cuda"):
+class BlockSparseSphericalTSDF:
+    def __init__(self, voxel_size=0.02, margin=0.08, block_res=32, max_depth=4.0, device="cuda"):
         """
-        Initializes a GPU-native dense TSDF volume.
-        vol_bounds: [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+        An infinitely scalable, GPU-native Block-Sparse TSDF.
+        block_res: How many voxels per side in a memory block (32^3 = 32,768 voxels per block).
+        max_depth: How far the camera can see (meters). Limits the active block sphere.
         """
         self.device = device
         self.voxel_size = voxel_size
         self.margin = margin
+        self.max_depth = max_depth
         
-        self.bounds = torch.tensor(vol_bounds, dtype=torch.float32, device=self.device)
-        self.vol_dim = torch.ceil((self.bounds[:, 1] - self.bounds[:, 0]) / self.voxel_size).long()
+        self.block_res = block_res
+        self.block_size = block_res * voxel_size
+        self.voxels_per_block = block_res ** 3
         
-        # 1. Generate dense voxel grid coordinates
-        x = torch.arange(self.vol_dim[0], dtype=torch.float32, device=self.device)
-        y = torch.arange(self.vol_dim[1], dtype=torch.float32, device=self.device)
-        z = torch.arange(self.vol_dim[2], dtype=torch.float32, device=self.device)
+        # Hash map of active space: (x, y, z) tuple -> Dict of tensors
+        self.blocks = {}
         
-        grid_x, grid_y, grid_z = torch.meshgrid(x, y, z, indexing='ij')
-        
-        self.vox_coords = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3)
-        self.world_coords = self.bounds[:, 0] + self.vox_coords * self.voxel_size
-        
-        # 2. Initialize TSDF and Weights
-        self.num_voxels = self.world_coords.shape[0]
-        self.tsdf = torch.ones(self.num_voxels, dtype=torch.float32, device=self.device)
-        self.weights = torch.zeros(self.num_voxels, dtype=torch.float32, device=self.device)
-        
-        # We also want to colorize it. Initialize an RGB volume.
-        self.colors = torch.zeros((self.num_voxels, 3), dtype=torch.float32, device=self.device)
+        # Pre-compute the local 3D coordinates for a generic block (saves VRAM)
+        x = torch.arange(self.block_res, device=self.device)
+        grid_x, grid_y, grid_z = torch.meshgrid(x, x, x, indexing='ij')
+        self.block_template = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3).float() * self.voxel_size
 
-        print(f"[TSDF] Initialized {self.vol_dim[0]}x{self.vol_dim[1]}x{self.vol_dim[2]} grid ({self.num_voxels} voxels) on {self.device}.")
+        print(f"[TSDF] Initialized Infinite Block-Sparse Grid. Voxel: {voxel_size}m, Block: {self.block_size:.2f}m")
+
+    def _allocate_block(self, key):
+        """Allocates a new 32x32x32 voxel block in VRAM."""
+        self.blocks[key] = {
+            'tsdf': torch.ones(self.voxels_per_block, dtype=torch.float32, device=self.device),
+            'weights': torch.zeros(self.voxels_per_block, dtype=torch.float32, device=self.device),
+            'colors': torch.zeros((self.voxels_per_block, 3), dtype=torch.float32, device=self.device)
+        }
 
     @torch.no_grad()
-    def integrate(self, depth_map, rgb_image, mask, pose, scale=1.0):
-        """
-        Projects the volume into the equirectangular camera to update SDF.
-        """
+    def integrate(self, depth_map, rgb_image, mask, pose):
         t_start = time.time()
         
         # Ensure inputs are tensors on the right device
@@ -51,80 +49,107 @@ class SphericalTSDFVolume:
             rgb_image = torch.from_numpy(rgb_image).float().to(self.device) / 255.0
             pose = torch.from_numpy(pose).float().to(self.device)
             
-        H, W = depth_map.shape
+        C = pose[:3, 3] # Camera position
         
-        # 1. Transform World Voxels to Camera Space
-        # world_coords_homo: [N, 4]
-        world_homo = torch.cat([self.world_coords, torch.ones((self.num_voxels, 1), device=self.device)], dim=1)
+        # 1. Find all Blocks within the camera's visual radius (max_depth)
+        min_b = torch.floor((C - self.max_depth) / self.block_size).int().cpu().numpy()
+        max_b = torch.ceil((C + self.max_depth) / self.block_size).int().cpu().numpy()
+        
+        active_keys = []
+        for x in range(min_b[0], max_b[0] + 1):
+            for y in range(min_b[1], max_b[1] + 1):
+                for z in range(min_b[2], max_b[2] + 1):
+                    # Prune corners of the bounding box to form a sphere
+                    center = torch.tensor([x + 0.5, y + 0.5, z + 0.5], device=self.device) * self.block_size
+                    if torch.norm(center - C) <= (self.max_depth + self.block_size):
+                        key = (x, y, z)
+                        active_keys.append(key)
+                        if key not in self.blocks:
+                            self._allocate_block(key)
+                            
+        if not active_keys: return
+        
+        # 2. Gather active blocks into a single batched tensor for lightning-fast math
+        B = len(active_keys)
+        N = self.voxels_per_block
+        
+        old_tsdf = torch.stack([self.blocks[k]['tsdf'] for k in active_keys]).view(B * N)
+        old_w = torch.stack([self.blocks[k]['weights'] for k in active_keys]).view(B * N)
+        old_colors = torch.stack([self.blocks[k]['colors'] for k in active_keys]).view(B * N, 3)
+        
+        # Calculate true world coordinates for these active blocks on the fly
+        offsets = torch.tensor(active_keys, device=self.device) * self.block_size
+        world_coords = (self.block_template.unsqueeze(0) + offsets.unsqueeze(1)).view(B * N, 3)
+        
+        # 3. Spherical Projection (Exactly as before, but bounded to active memory)
+        world_homo = torch.cat([world_coords, torch.ones((B * N, 1), device=self.device)], dim=1)
         pose_inv = torch.linalg.inv(pose)
-        
-        # cam_coords: [N, 3]
         cam_coords = (world_homo @ pose_inv.T)[:, :3]
         
-        # 2. Spherical Projection (Cartesian to Theta/Phi)
         X, Y, Z = cam_coords[:, 0], cam_coords[:, 1], cam_coords[:, 2]
-        
-        # Voxel distance from camera
         r = torch.sqrt(X**2 + Y**2 + Z**2)
         
-        # Spherical angles
-        phi = torch.asin(Y / r)         # Latitude: [-pi/2, pi/2]
-        theta = torch.atan2(X, Z)       # Longitude: [-pi, pi]
+        phi = torch.asin(Y / (r + 1e-6))
+        theta = torch.atan2(X, Z)
         
-        # Normalize to [-1, 1] for grid_sample
         u_norm = theta / torch.pi
         v_norm = phi / (torch.pi / 2.0)
+        grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0)
         
-        grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0) # Shape: [1, 1, N, 2]
-        
-        # 3. Sample Depth and Masks
-        # We need to reshape maps for grid_sample: [B, C, H, W]
-        depth_tensor = depth_map.unsqueeze(0).unsqueeze(0) * scale 
+        depth_tensor = depth_map.unsqueeze(0).unsqueeze(0)
         mask_tensor = mask.unsqueeze(0).unsqueeze(0)
-        rgb_tensor = rgb_image.permute(2, 0, 1).unsqueeze(0) # [1, 3, H, W]
+        rgb_tensor = rgb_image.permute(2, 0, 1).unsqueeze(0)
         
-        # grid_sample uses bilinear interpolation instantly on millions of points
         sampled_depth = F.grid_sample(depth_tensor, grid, mode='bilinear', align_corners=True).squeeze()
         sampled_mask = F.grid_sample(mask_tensor, grid, mode='nearest', align_corners=True).squeeze()
-        sampled_rgb = F.grid_sample(rgb_tensor, grid, mode='bilinear', align_corners=True).squeeze().T # [N, 3]
+        sampled_rgb = F.grid_sample(rgb_tensor, grid, mode='bilinear', align_corners=True).squeeze().T
         
-        # 4. Calculate Signed Distance
+        # 4. TSDF Update logic
         sdf = sampled_depth - r
         
-        # 5. Determine Valid Integration Zone
-        # Valid if: Ray hit the mask, Depth is positive, and voxel is NOT way behind the surface
-        valid = (sampled_mask > 0.5) & (sampled_depth > 0.1) & (sdf > -self.margin)
+        # Valid if: Masked, Depth > 0, Ray is within max_depth, and SDF > -margin
+        valid = (sampled_mask > 0.5) & (sampled_depth > 0.1) & (r < self.max_depth) & (sdf > -self.margin)
         
-        # 6. Truncate and Update
         tsdf_update = torch.clamp(sdf[valid] / self.margin, -1.0, 1.0)
         
-        old_tsdf = self.tsdf[valid]
-        old_w = self.weights[valid]
+        new_w = 1.0 
+        old_tsdf[valid] = (old_tsdf[valid] * old_w[valid] + tsdf_update * new_w) / (old_w[valid] + new_w)
+        old_colors[valid] = (old_colors[valid] * old_w[valid].unsqueeze(1) + sampled_rgb[valid] * new_w) / (old_w[valid].unsqueeze(1) + new_w)
+        old_w[valid] += new_w
         
-        new_w = 1.0 # Simple constant weighting
+        # 5. Scatter the updated data back into the discrete block dictionary
+        new_tsdf = old_tsdf.view(B, N)
+        new_weights = old_w.view(B, N)
+        new_colors = old_colors.view(B, N, 3)
         
-        # Running average formula
-        self.tsdf[valid] = (old_tsdf * old_w + tsdf_update * new_w) / (old_w + new_w)
-        self.colors[valid] = (self.colors[valid] * old_w.unsqueeze(1) + sampled_rgb[valid] * new_w) / (old_w.unsqueeze(1) + new_w)
-        self.weights[valid] += new_w
-        
-        print(f"      [Profile - TSDF] Raycast integration took {time.time() - t_start:.4f} sec")
+        for i, k in enumerate(active_keys):
+            self.blocks[k]['tsdf'] = new_tsdf[i]
+            self.blocks[k]['weights'] = new_weights[i]
+            self.blocks[k]['colors'] = new_colors[i]
+            
+        print(f"      [Profile - TSDF] Processed {B} blocks ({B*N} voxels) in {time.time() - t_start:.4f} sec")
 
-    def extract_point_cloud(self, surface_threshold=0.15):
-        """
-        Extracts active surface voxels into an Open3D point cloud.
-        """
+    def extract_point_cloud(self, surface_threshold=0.02):
+        """Extracts exactly the surfaces from all allocated blocks."""
         t_start = time.time()
+        all_points, all_colors = [], []
         
-        # Surface voxels are near zero-crossing and have been observed
-        surface_mask = (torch.abs(self.tsdf) < surface_threshold) & (self.weights > 0)
-        
-        surface_coords = self.world_coords[surface_mask].cpu().numpy()
-        surface_colors = self.colors[surface_mask].cpu().numpy()
-        
+        for k, block in self.blocks.items():
+            valid = (torch.abs(block['tsdf']) < surface_threshold) & (block['weights'] > 0)
+            if not valid.any(): continue
+            
+            offset = torch.tensor(k, device=self.device) * self.block_size
+            coords = self.block_template + offset
+            
+            all_points.append(coords[valid])
+            all_colors.append(block['colors'][valid])
+            
+        if not all_points:
+            return o3d.geometry.PointCloud()
+            
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(surface_coords)
-        pcd.colors = o3d.utility.Vector3dVector(surface_colors)
+        pcd.points = o3d.utility.Vector3dVector(torch.cat(all_points).cpu().numpy())
+        pcd.colors = o3d.utility.Vector3dVector(torch.cat(all_colors).cpu().numpy())
         
         print(f"      [Profile - Extraction] Extracted {len(pcd.points)} points in {time.time() - t_start:.4f} sec")
         return pcd
