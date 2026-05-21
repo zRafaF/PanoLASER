@@ -3,31 +3,51 @@ import numpy as np
 import open3d as o3d
 
 from .inference_utils import align_cam_pts_irls
+from .utils.geometry import register_camera_poses_kabsch
 
 class PanoStreamingEngine:
-    def __init__(self, vanilla_engine, window_size=2, overlap=1):
+    def __init__(self, vanilla_engine, window_size=3, overlap=2):
         self.engine = vanilla_engine
         self.window_size = window_size
         self.overlap = overlap
         
-        if overlap != 1:
-            raise ValueError("This engine is currently optimized for exact 1-frame odometry chaining.")
+        if self.overlap < 2:
+            print("WARNING: Kabsch requires an overlap of >= 2 to guarantee a stable 3D rotation.")
         self.reset()
         
     def reset(self):
         """Clears the temporal memory for a new video sequence."""
         self.global_pcd = o3d.geometry.PointCloud()
-        self.prev_raw_pts = None
-        self.prev_global_pose = None
+        self.prev_overlap_raw_pts = []
+        self.prev_overlap_global_poses = []
+        self.prev_overlap_masks = []
         self.is_first_window = True
+
+    def _apply_sim3_to_pose(self, local_pose, R_align, t_align, scale):
+        """
+        Applies a Sim(3) transformation to a local SE(3) pose.
+        Produces a mathematically strict, un-sheared SE(3) global pose.
+        """
+        # 1. Scale ONLY the translation component of the local pose
+        L_scaled = local_pose.copy()
+        L_scaled[:3, 3] *= scale
+
+        # 2. Create the strict rigid alignment matrix
+        T_align = np.eye(4)
+        T_align[:3, :3] = R_align
+        T_align[:3, 3] = t_align
+
+        # 3. Chain them (Avoids the rotation scaling bug in the original LASER code)
+        return T_align @ L_scaled
 
     def _build_global_pcd(self, raw_pts, rgb, mask, global_pose, scale=1.0):
         """Filters invalid pixels, applies scale, and transforms into global space."""
         valid = mask.astype(bool)
+        # 1. Scale the local geometry points
         pts = raw_pts[valid] * scale
         colors = rgb[valid] / 255.0
         
-        # Apply global 4x4 pose matrix using homogeneous coordinates
+        # 2. Transform to global space using the strict SE(3) pose
         ones = np.ones((pts.shape[0], 1))
         pts_homo = np.hstack([pts, ones])
         pts_global = (global_pose @ pts_homo.T).T[:, :3]
@@ -38,14 +58,15 @@ class PanoStreamingEngine:
         return pcd
 
     def process_sequence(self, frames, masks):
-        """Processes a sequence using Exact Odometry Chaining & IRLS Scale Alignment."""
+        """Processes a sequence using exact Kabsch alignment and Sim(3) Odometry."""
         self.reset()
+        step = self.window_size - self.overlap
         
-        for i in range(0, len(frames) - 1, self.window_size - self.overlap):
+        for i in range(0, len(frames) - self.window_size + 1, step):
             window_frames = frames[i : i + self.window_size]
             window_masks = masks[i : i + self.window_size]
             
-            print(f"\\n[Streaming Engine] Processing Window {i}...")
+            print(f"\n[Streaming Engine] Processing Window (Frames {i} to {i + self.window_size - 1})...")
             preds = self.engine(window_frames)
             pts_list = preds["points"]
             poses = preds["poses"]
@@ -56,41 +77,52 @@ class PanoStreamingEngine:
                     pcd = self._build_global_pcd(pts_list[j], window_frames[j], window_masks[j], poses[j])
                     self.global_pcd += pcd
                     
-                # Track the overlapping frame (Frame B)
-                self.prev_raw_pts = pts_list[-1]
-                self.prev_global_pose = poses[-1]
+                # Store the overlapping frames for the next window
+                self.prev_overlap_raw_pts = pts_list[-self.overlap:]
+                self.prev_overlap_global_poses = list(poses[-self.overlap:])
+                self.prev_overlap_masks = window_masks[-self.overlap:]
                 self.is_first_window = False
                 
             else:
+                curr_overlap_raw_pts = pts_list[:self.overlap]
+                curr_overlap_local_poses = poses[:self.overlap]
+                curr_overlap_masks = window_masks[:self.overlap]
+                
                 # 1. IRLS Scale Drift Correction
-                curr_raw_pts = pts_list[0]
-                mask_torch = torch.from_numpy(window_masks[0])
+                scale_diffs = []
+                for k in range(self.overlap):
+                    s = align_cam_pts_irls(
+                        torch.from_numpy(curr_overlap_raw_pts[k]), 
+                        torch.from_numpy(self.prev_overlap_raw_pts[k]), 
+                        torch.from_numpy(curr_overlap_masks[k])
+                    )
+                    scale_diffs.append(s)
+                scale_diff = float(np.median(scale_diffs))
                 
-                scale_diff = align_cam_pts_irls(
-                    torch.from_numpy(curr_raw_pts), 
-                    torch.from_numpy(self.prev_raw_pts), 
-                    mask_torch
-                )
-                print(f"  -> Scale Drift Corrected: {scale_diff:.4f}")
+                # 2. Kabsch Rigid Alignment on multiple camera poses
+                tgt_cam_np = np.stack(self.prev_overlap_global_poses)
+                src_cam_np = np.stack(curr_overlap_local_poses)
+                R, t = register_camera_poses_kabsch(tgt_cam_np, src_cam_np, scale=scale_diff)
+                print(f"  -> Kabsch Rotation Lock & Scale Corrected: {scale_diff:.4f}")
                 
-                # 2. Exact Odometry Chaining for the new frame (Frame C)
-                new_raw_pts = pts_list[1]
-                new_local_pose = poses[1]
+                # 3. Stitch new frames
+                new_global_poses = []
+                for j in range(self.overlap, self.window_size):
+                    new_raw_pts = pts_list[j]
+                    new_local_pose = poses[j]
+                    
+                    # Apply pure Sim(3) transform to the camera pose
+                    new_global_pose = self._apply_sim3_to_pose(new_local_pose, R, t, scale_diff)
+                    new_global_poses.append(new_global_pose)
+                    
+                    pcd = self._build_global_pcd(new_raw_pts, window_frames[j], window_masks[j], new_global_pose, scale=scale_diff)
+                    self.global_pcd += pcd
                 
-                # Scale the Translation component of the local pose
-                local_pose_scaled = new_local_pose.copy()
-                local_pose_scaled[:3, 3] *= scale_diff
-                
-                # Chain the scaled local transform onto the global trajectory anchor
-                new_global_pose = self.prev_global_pose @ local_pose_scaled
-                
-                # Build the scaled, globally aligned point cloud
-                pcd = self._build_global_pcd(new_raw_pts, window_frames[1], window_masks[1], new_global_pose, scale=scale_diff)
-                self.global_pcd += pcd
-                
-                # Update tracking for the next iteration
-                self.prev_raw_pts = new_raw_pts
-                self.prev_global_pose = new_global_pose
+                # 4. Update tracking state for next iteration
+                self.prev_overlap_raw_pts = pts_list[-self.overlap:]
+                window_global_poses = self.prev_overlap_global_poses + new_global_poses
+                self.prev_overlap_global_poses = window_global_poses[-self.overlap:]
+                self.prev_overlap_masks = window_masks[-self.overlap:]
 
         # Downsample final map
         self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.05)

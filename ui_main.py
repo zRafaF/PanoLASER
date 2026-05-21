@@ -18,7 +18,7 @@ from inference_engine.utils.geometry import unproject_equirectangular_to_points
 print("Initializing Architecture Stack...")
 base_model_wrapper = PanoVGGTExtractor()
 vanilla_engine = PanoVanillaEngine(base_model_wrapper.model)
-streaming_engine = PanoStreamingEngine(vanilla_engine, window_size=2, overlap=1)
+streaming_engine = PanoStreamingEngine(vanilla_engine, window_size=3, overlap=2)
 
 def get_o3d_pcd(xyz_points, rgb_image, mask):
     valid_mask = mask.astype(bool)
