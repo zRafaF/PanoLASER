@@ -75,73 +75,49 @@ class PanoStreamingEngine:
         return pcd
 
     def process_sequence(self, frames, masks):
-        """Processes a sequence using exact Kabsch alignment and Sim(3) Odometry."""
         self.reset()
-        step = self.window_size - self.overlap
         
-        for i in range(0, len(frames) - self.window_size + 1, step):
-            window_frames = frames[i : i + self.window_size]
-            window_masks = masks[i : i + self.window_size]
+        # 1. Generate all local PCDs and initial poses
+        pcds = []
+        poses = []
+        for i in range(len(frames)):
+            preds = self.engine([frames[i]]) # Single frame inference
+            pts = preds["points"][0]
+            pose = preds["poses"][0]
             
-            print(f"\n[Streaming Engine] Processing Window (Frames {i} to {i + self.window_size - 1})...")
-            preds = self.engine(window_frames)
-            pts_list = preds["points"]
-            poses = preds["poses"]
+            pcd = self._build_global_pcd(pts, frames[i], masks[i], pose, scale=1.0)
+            pcds.append(pcd)
+            poses.append(pose)
             
-            if self.is_first_window:
-                # First window anchors the global map
-                for j in range(self.window_size):
-                    pcd = self._build_global_pcd(pts_list[j], window_frames[j], window_masks[j], poses[j])
-                    self.global_pcd += pcd
-                    
-                # Store the overlapping frames for the next window
-                self.prev_overlap_raw_pts = pts_list[-self.overlap:]
-                self.prev_overlap_global_poses = list(poses[-self.overlap:])
-                self.prev_overlap_masks = window_masks[-self.overlap:]
-                self.is_first_window = False
-                
-            else:
-                curr_overlap_raw_pts = pts_list[:self.overlap]
-                curr_overlap_local_poses = poses[:self.overlap]
-                curr_overlap_masks = window_masks[:self.overlap]
-                
-                # 1. IRLS Scale Drift Correction
-                scale_diffs = []
-                for k in range(self.overlap):
-                    s = align_cam_pts_irls(
-                        torch.from_numpy(curr_overlap_raw_pts[k]), 
-                        torch.from_numpy(self.prev_overlap_raw_pts[k]), 
-                        torch.from_numpy(curr_overlap_masks[k])
-                    )
-                    scale_diffs.append(s)
-                scale_diff = float(np.median(scale_diffs))
-                
-                # 2. Kabsch Rigid Alignment on multiple camera poses
-                tgt_cam_np = np.stack(self.prev_overlap_global_poses)
-                src_cam_np = np.stack(curr_overlap_local_poses)
-                R, t = register_camera_poses_kabsch(tgt_cam_np, src_cam_np, scale=scale_diff)
-                print(f"  -> Kabsch Rotation Lock & Scale Corrected: {scale_diff:.4f}")
-                
-                # 3. Stitch new frames
-                new_global_poses = []
-                for j in range(self.overlap, self.window_size):
-                    new_raw_pts = pts_list[j]
-                    new_local_pose = poses[j]
-                    
-                    # Apply pure Sim(3) transform to the camera pose
-                    new_global_pose = self._apply_sim3_to_pose(new_local_pose, R, t, scale_diff)
-                    new_global_poses.append(new_global_pose)
-                    
-                    pcd = self._build_global_pcd(new_raw_pts, window_frames[j], window_masks[j], new_global_pose, scale=scale_diff)
-                    self.global_pcd += pcd
-                
-                # 4. Update tracking state for next iteration
-                self.prev_overlap_raw_pts = pts_list[-self.overlap:]
-                window_global_poses = self.prev_overlap_global_poses + new_global_poses
-                self.prev_overlap_global_poses = window_global_poses[-self.overlap:]
-                self.prev_overlap_masks = window_masks[-self.overlap:]
-
-        # Downsample final map
-        self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.05)
-        print("[Streaming Engine] Sequence processing complete.")
-        return self.global_pcd
+        # 2. Build Pose Graph for Global Optimization
+        pose_graph = o3d.pipelines.registration.PoseGraph()
+        odometry = np.eye(4)
+        pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(odometry))
+        
+        for i in range(1, len(pcds)):
+            # Use Point-to-Plane ICP for fine-grained locking
+            icp = o3d.pipelines.registration.registration_icp(
+                pcds[i], pcds[i-1], 2.0, np.eye(4),
+                o3d.pipelines.registration.TransformationEstimationPointToPlane()
+            )
+            odometry = odometry @ icp.transformation
+            pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.linalg.inv(odometry)))
+            
+            # Add edge
+            pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(i-1, i, icp.transformation, uncertain=False))
+            
+        # 3. Optimize Global Consistency
+        option = o3d.pipelines.registration.GlobalOptimizationOption(max_correspondence_distance=2.0)
+        o3d.pipelines.registration.global_optimization(
+            pose_graph, 
+            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+            o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(), 
+            option
+        )
+        
+        # 4. Integrate
+        for i in range(len(pcds)):
+            pcds[i].transform(pose_graph.nodes[i].pose)
+            self.global_pcd += pcds[i]
+            
+        return self.global_pcd.voxel_down_sample(voxel_size=0.05)
