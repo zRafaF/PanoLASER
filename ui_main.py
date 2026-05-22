@@ -110,20 +110,24 @@ def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
     out += "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
     return out
 
-def process_sequence_ui(input_mode, uploaded_files, local_dir, decimation, zenith_limit, nadir_limit, target_width, target_height):
-    file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
+def process_sequence_ui(image_files, zenith_limit, nadir_limit, target_width, target_height, window_size, overlap):
+    if not image_files or len(image_files) < 2:
+        raise gr.Error("Please upload at least 2 images.")
     
-    if not file_paths or len(file_paths) < 2:
-        raise gr.Error("Please ensure at least 2 valid images are provided after decimation.")
+    image_files = sorted(image_files, key=lambda x: x.name)
     
     frames = []
     masks = []
-    for f_path in file_paths:
-        img_pil = Image.open(f_path).convert("RGB").resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
+    for f in image_files:
+        img_pil = Image.open(f.name).convert("RGB").resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
         img_np = np.array(img_pil)
         frames.append(img_np)
         mask = get_spherical_valid_mask(img_np.shape[0], img_np.shape[1], zenith_deg=zenith_limit, nadir_deg=nadir_limit)
         masks.append(mask)
+
+    # Re-configure engine variables dynamically per UI run
+    streaming_engine.window_size = int(window_size)
+    streaming_engine.overlap = int(overlap)
 
     global_pcd = streaming_engine.process_sequence(frames, masks)
     return create_plotly_figure_from_pcd(global_pcd), save_pcd_to_ply(global_pcd, "global_stitched_map")
@@ -152,6 +156,11 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
             gr.Markdown("### Polar Exclusion Limits")
             zenith_slider = gr.Slider(minimum=0, maximum=90, value=75, step=1, label="Zenith Limit")
             nadir_slider = gr.Slider(minimum=-90, maximum=0, value=-60, step=1, label="Nadir Limit")
+
+            # Add these sliders right beneath the nadir slider:
+            gr.Markdown("### Submap Configuration (SLAM)")
+            window_size_slider = gr.Slider(minimum=3, maximum=32, value=16, step=1, label="Submap Window Size (Frames Batch)")
+            overlap_slider = gr.Slider(minimum=2, maximum=8, value=4, step=1, label="Submap Frame Overlap")
             
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -212,7 +221,10 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
     
     run_seq_btn.click(
         fn=process_sequence_ui,
-        inputs=[input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, target_width, target_height],
+        inputs=[
+            input_seq, zenith_slider, nadir_slider, target_width, target_height,
+            window_size_slider, overlap_slider
+        ],
         outputs=[output_3d_seq, download_seq],
         api_name=False
     )
