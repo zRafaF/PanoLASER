@@ -53,3 +53,14 @@ class PanoPoseGraph:
             return self.optimized_values.atPose3(node_id).matrix()
         return self.initial_estimates.atPose3(node_id).matrix()
     
+    def add_loop_closure(self, from_id: int, to_id: int, relative_mat: np.ndarray, noise_multiplier: float = 2.0):
+        """Adds a loop closure constraint. Noise is slightly relaxed to let the graph flex and settle."""
+        rel_pose3 = self._matrix_to_pose3(relative_mat)
+        
+        # Loop closures inherently have more uncertainty than sequential odometry, 
+        # so we relax the noise model slightly so the graph doesn't mathematically snap/break.
+        lc_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([0.05, 0.05, 0.05, 0.1, 0.1, 0.1]) * noise_multiplier
+        )
+        
+        self.graph.add(gtsam.BetweenFactorPose3(from_id, to_id, rel_pose3, lc_noise))
