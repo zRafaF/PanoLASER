@@ -10,33 +10,28 @@ dependencies = [
     "torchvision>=0.19.0",
     "torchaudio>=2.4.0",
     "xformers>=0.0.27.post2",
-    
     # Core Math & Arrays
     "numpy==1.26.4",
     "scipy",
     "pandas",
-    
     # Image Processing & Vision
     "opencv-python",
     "pillow",
     "imageio",
     "scikit-image",
     "kornia",
-    
     # 3D & Geometry
     "open3d",
     "trimesh",
     "plyfile",
     "pypose",
     "evo",
-    
     # Model & Training Utils
     "einops",
     "huggingface-hub",
     "safetensors",
     "scikit-learn",
     "tensorboard",
-    
     # Configuration & System
     "hydra-core",
     "omegaconf",
@@ -45,12 +40,12 @@ dependencies = [
     "tqdm",
     "cython",
     "numba",
-    
     # Web / UI
     "gradio>=5.17.1",
     "fastapi==0.119.0",
     "flask==3.1.2",
     "plotly>=6.7.0",
+    "gtsam>=4.2.1",
 ]
 
 # Tell uv where to find the CUDA 12.4 PyTorch wheels

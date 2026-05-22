@@ -478,6 +478,21 @@ wheels = [
 ]
 
 [[package]]
+name = "gtsam"
+version = "4.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pyparsing" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5c/81/abbe1246a00e5128936317ca08f03061099582bc2c1c79fb30fc935552bc/gtsam-4.2.1-cp311-cp311-macosx_10_15_x86_64.whl", hash = "sha256:95a9d2632bddbf8f476a50150180edf1f6611a19e1891f4dddc904421701102a", size = 21561298, upload-time = "2026-05-01T21:42:48.312Z" },
+    { url = "https://files.pythonhosted.org/packages/05/d7/b55a6d070e21570867f7b89abc18d2de3ba1d0074d9619712bce0ba33d80/gtsam-4.2.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:ace2a285b877d912b15002cdb069c83507946b7d44616a7f97e8255523e78ad7", size = 19924491, upload-time = "2026-05-01T21:42:52.296Z" },
+    { url = "https://files.pythonhosted.org/packages/94/90/f40ce79d2005d39995b34a93538b058506434502ca735d74ee279ca64b52/gtsam-4.2.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9425d0d27e7dc6bb9639136ecd8b129f8a2591617c9074498f1b4dd984af514f", size = 21483080, upload-time = "2026-05-01T21:42:57.539Z" },
+    { url = "https://files.pythonhosted.org/packages/04/95/37e6c9bc64795af7c7becd45e4cff55ee5d7bedd2fcd6a87f94082f3228a/gtsam-4.2.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:4e469d955a03a6e55b7136a3a99d59444370e74135ea917da9a756d99fb3461f", size = 22377997, upload-time = "2026-05-01T21:43:02.453Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1213,6 +1228,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "flask" },
     { name = "gradio" },
+    { name = "gtsam" },
     { name = "huggingface-hub" },
     { name = "hydra-core" },
     { name = "imageio" },
@@ -1250,6 +1266,7 @@ requires-dist = [
     { name = "fastapi", specifier = "==0.119.0" },
     { name = "flask", specifier = "==3.1.2" },
     { name = "gradio", specifier = ">=5.17.1" },
+    { name = "gtsam", specifier = ">=4.2.1" },
     { name = "huggingface-hub" },
     { name = "hydra-core" },
     { name = "imageio" },
