@@ -5,7 +5,7 @@ import time
 
 from .inference_utils import align_cam_pts_irls
 from .utils.geometry import register_camera_poses_kabsch
-from .tsdf_volume import BlockSparseSphericalTSDF  # Use our new infinitely scalable class
+from .tsdf_volume import FastStaticTSDF
 
 class PanoStreamingEngine:
     def __init__(self, vanilla_engine, window_size=3, overlap=2):
@@ -19,8 +19,8 @@ class PanoStreamingEngine:
         self.reset()
         
     def reset(self):
-        # We pass max_depth=4.0 to limit the active sphere tracking.
-        self.tsdf = BlockSparseSphericalTSDF(voxel_size=0.02, margin=0.08, max_depth=4.0, device=self.device)
+        # Increased max_depth to 6.0 to easily hit the ground and far ceilings
+        self.tsdf = FastStaticTSDF(voxel_size=0.02, margin=0.08, max_depth=6.0, device=self.device)
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
         self.is_first_window = True
