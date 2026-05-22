@@ -29,8 +29,6 @@ class FastStaticTSDF:
         grid_x, grid_y, grid_z = torch.meshgrid(x, x, x, indexing='ij')
         self.block_template = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3).float() * self.voxel_size
 
-        print(f"[TSDF] Ready. Bubble Size: {max_depth * 2}m diameter. Max Capacity: {max_blocks * self.voxels_per_block / 1e6:.1f}M voxels.")
-
     @torch.no_grad()
     def integrate(self, depth_map, rgb_image, mask, pose):
         t_start = time.time()
@@ -43,7 +41,6 @@ class FastStaticTSDF:
             
         C = pose[:3, 3]
         
-        # 1. Vectorized Frustum Bounding Box
         min_b = torch.floor((C - self.max_depth) / self.block_size).int()
         max_b = torch.ceil((C + self.max_depth) / self.block_size).int()
         
@@ -60,7 +57,6 @@ class FastStaticTSDF:
         
         valid_blocks_cpu = valid_blocks.cpu().numpy()
         
-        # 2. Pool Assignment (Fixing the PyTorch List Warning!)
         active_indices = []
         kept_indices = []
         for i, row in enumerate(valid_blocks_cpu):
@@ -71,14 +67,12 @@ class FastStaticTSDF:
                 self.block_hash[k] = self.next_idx
                 self.next_idx += 1
             active_indices.append(self.block_hash[k])
-            kept_indices.append(i)  # Keep the index, not the array
+            kept_indices.append(i) 
             
         if not active_indices: return
         
-        # Slice the tensor directly, bypassing list conversion completely!
         valid_blocks_tensor = valid_blocks[kept_indices]
         B_total = len(active_indices)
-        
         chunk_size = 256
         
         pose_inv = torch.linalg.inv(pose)
@@ -125,10 +119,23 @@ class FastStaticTSDF:
             
             tsdf_update = torch.clamp(sdf[valid] / self.margin, -1.0, 1.0)
             
-            old_tsdf[valid] = (old_tsdf[valid] * old_w[valid] + tsdf_update) / (old_w[valid] + 1.0)
-            old_w[valid] += 1.0
+            # --- FIX 2: ASYMMETRIC CONFIDENCE WEIGHTING ---
+            # 1. Close observations inherently get more weight.
+            w_dist = 1.0 / (r[valid] + 0.5) 
             
-            closer_mask = r < old_min_dist
+            # 2. Carving Decay: If a ray thinks a voxel is "empty space" (sdf > margin), 
+            # make its updating power 10x weaker to protect thin objects from grazing rays.
+            w_carve = torch.where(sdf[valid] > self.margin, 0.1, 1.0).to(self.device)
+            
+            new_w = w_dist * w_carve
+            
+            # Apply the weighted update
+            old_tsdf[valid] = (old_tsdf[valid] * old_w[valid] + tsdf_update * new_w) / (old_w[valid] + new_w)
+            old_w[valid] += new_w
+            
+            # --- FIX 1: COLOR HYSTERESIS ---
+            # Must be at least 15cm closer to steal the color, preventing micro-tearing.
+            closer_mask = r < (old_min_dist - 0.15)
             color_update_mask = valid & closer_mask
             
             if color_update_mask.any():
@@ -139,12 +146,7 @@ class FastStaticTSDF:
             self.weights[idx_tensor] = old_w.view(B, N)
             self.colors[idx_tensor] = old_colors.view(B, N, 3)
             self.min_dist[idx_tensor] = old_min_dist.view(B, N)
-            
-        # Optional sync inside TSDF class to get exact integration time per frame
-        # torch.cuda.synchronize()
-        # print(f"      [Profile - TSDF] VRAM Math: Processed {B_total} blocks ({B_total*self.voxels_per_block/1e6:.1f}M voxels) in {time.time() - t_start:.4f} sec")
 
-    # [FIX] Added surface_threshold argument to prevent TypeError
     def extract_point_cloud(self, surface_threshold=None):
         t_start = time.time()
         
