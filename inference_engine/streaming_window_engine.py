@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .inference_utils import align_cam_pts_irls
 from .utils.geometry import register_camera_poses_kabsch
 from .tsdf_volume import FastStaticTSDF  
-from .pano_graph import PanoPoseGraph  # Import our new GTSAM wrapper
+from .pano_graph import PanoPoseGraph  
 
 class PanoStreamingEngine:
     def __init__(self, vanilla_engine, window_size=16, overlap=2):
@@ -28,33 +28,20 @@ class PanoStreamingEngine:
             self.tsdf_future.result()
             
         self.tsdf = FastStaticTSDF(voxel_size=0.02, margin=0.08, max_depth=6.0, device=self.device)
-        self.pose_graph = PanoPoseGraph() # Initialize GTSAM
+        self.pose_graph = PanoPoseGraph()
         
         self.prev_overlap_raw_pts = []
-        self.prev_overlap_local_poses = []
+        self.prev_overlap_global_poses = []
         
         self.is_first_window = True
-        self.metric_scale = 1.0
+        self.current_metric_scale = 1.0
         self.last_integrated_pose = None
         self.submap_count = 0
-
-    def _apply_sim3_to_pose(self, local_pose, R_align, t_align, scale):
-        L_scaled = local_pose.copy()
-        L_scaled[:3, 3] *= scale
-        T_align = np.eye(4)
-        T_align[:3, :3] = R_align
-        T_align[:3, 3] = t_align
-        candidate_pose = T_align @ L_scaled
-        
-        up_vector_world = candidate_pose[:3, 1] 
-        if up_vector_world[1] < 0:
-            flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-            candidate_pose[:3, :3] = candidate_pose[:3, :3] @ flip_R
-        return candidate_pose
 
     def _is_keyframe(self, current_pose, trans_thresh=0.15, rot_thresh=5.0):
         if self.last_integrated_pose is None:
             return True
+        # Both poses are now in strict global metric space (meters)
         dt = np.linalg.norm(current_pose[:3, 3] - self.last_integrated_pose[:3, 3])
         R_diff = self.last_integrated_pose[:3, :3].T @ current_pose[:3, :3]
         trace = np.clip(np.trace(R_diff), -1.0, 3.0)
@@ -94,98 +81,104 @@ class PanoStreamingEngine:
             pts_list = preds["points"] 
             poses = preds["poses"]
             
-            batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
-            
+            # --- 2. UPDATE GLOBAL SCALE ---
             if self.is_first_window:
-                self.world_anchor = np.linalg.inv(poses[0])
-                
-                # Grounding
                 first_depth = np.linalg.norm(pts_list[0], axis=-1)
                 valid_depths = first_depth[first_depth > 0.1]
                 if len(valid_depths) > 0:
-                    self.metric_scale = 3.0 / np.median(valid_depths)
-                
-                # Setup First Node in GTSAM
-                self.pose_graph.add_prior(self.submap_count, np.eye(4))
-                
-                for j in range(self.window_size):
-                    aligned_pose = self.world_anchor @ poses[j]
-                    scaled_pts = pts_list[j] * self.metric_scale
-                    
-                    batch_depths.append(np.linalg.norm(scaled_pts, axis=-1))
-                    batch_rgbs.append(window_frames[j])
-                    batch_masks.append(window_masks[j])
-                    batch_poses.append(aligned_pose)
-                    
-                self.prev_overlap_raw_pts = [pts * self.metric_scale for pts in pts_list[-self.overlap:]]
-                self.prev_overlap_local_poses = poses[-self.overlap:]
-                self.is_first_window = False
-                
+                    self.current_metric_scale = 3.0 / np.median(valid_depths)
             else:
-                scaled_incoming_pts = [pts * self.metric_scale for pts in pts_list]
-                
+                # Wait for TSDF thread so variables don't race
                 if self.tsdf_future is not None:
                     integ_count, t_time = self.tsdf_future.result()
                     print(f"  [Profile] Background TSDF Thread mapped {integ_count} keyframes.")
-                
-                # Calculate the Transform from the previous submap to the current submap
+
                 raw_scale_diff = align_cam_pts_irls(
-                    torch.from_numpy(scaled_incoming_pts[0].copy()), 
+                    torch.from_numpy(pts_list[0].copy()), 
                     torch.from_numpy(self.prev_overlap_raw_pts[0].copy()), 
                     torch.from_numpy(window_masks[0].copy())
                 )
+                # Inertia smoothing
+                clipped_scale = np.clip(raw_scale_diff, 0.95, 1.05)
+                self.current_metric_scale *= (0.8 * 1.0 + 0.2 * clipped_scale)
+
+            # --- 3. CONVERT TO CANONICAL LOCAL SPACE ---
+            metric_local_poses = []
+            for p in poses:
+                mp = p.copy()
+                mp[:3, 3] *= self.current_metric_scale  # Enforce metric translation
+                metric_local_poses.append(mp)
                 
-                scale_diff = 0.8 * 1.0 + 0.2 * np.clip(raw_scale_diff, 0.95, 1.05)
+            # Shift the entire submap so frame 0 sits at the Origin (I)
+            submap_origin_inv = np.linalg.inv(metric_local_poses[0])
+            canonical_poses = [submap_origin_inv @ mp for mp in metric_local_poses]
+
+            # --- 4. GTSAM GLOBAL OPTIMIZATION ---
+            if self.is_first_window:
+                anchor_guess = np.eye(4)
+                self.pose_graph.add_prior(self.submap_count, anchor_guess)
+            else:
+                # Align Canonical Local Overlap to Global Previous Overlap
+                src_cam_np = np.stack(canonical_poses[:self.overlap])
+                tgt_cam_np = np.stack(self.prev_overlap_global_poses)
                 
-                src_cam_np = np.stack(poses[:self.overlap])
-                tgt_cam_np = np.stack(self.prev_overlap_local_poses)
-                R_align, t_align = register_camera_poses_kabsch(src_cam_np, tgt_cam_np, scale=scale_diff)
+                # Because both spaces are purely metric, scale is explicitly 1.0
+                R_align, t_align = register_camera_poses_kabsch(src_cam_np, tgt_cam_np, scale=1.0)
                 
-                # Create the relative transformation matrix
-                T_relative = np.eye(4)
-                T_relative[:3, :3] = R_align
-                T_relative[:3, 3] = t_align
+                anchor_guess = np.eye(4)
+                anchor_guess[:3, :3] = R_align
+                anchor_guess[:3, 3] = t_align
                 
-                # Fetch the optimized pose of the PREVIOUS submap from GTSAM
-                prev_optimized_pose = self.pose_graph.get_optimized_pose(self.submap_count - 1)
+                prev_opt_anchor = self.pose_graph.get_optimized_pose(self.submap_count - 1)
                 
-                # Calculate the initial guess for the CURRENT submap
-                current_initial_guess = prev_optimized_pose @ T_relative
+                # Calculate the relative odometry step
+                T_rel = np.linalg.inv(prev_opt_anchor) @ anchor_guess
                 
-                # Add Odometry Edge to GTSAM
                 self.pose_graph.add_odometry(
                     from_id=self.submap_count - 1, 
                     to_id=self.submap_count, 
-                    relative_mat=T_relative, 
-                    initial_estimate_mat=current_initial_guess
+                    relative_mat=T_rel, 
+                    initial_estimate_mat=anchor_guess
                 )
                 
-                # Optimize the graph
                 t_opt = time.time()
                 self.pose_graph.optimize()
                 print(f"  [Profile] GTSAM Optimization: {time.time() - t_opt:.4f} sec")
-                
-                # Extract the newly optimized anchor pose for this submap
-                optimized_submap_anchor = self.pose_graph.get_optimized_pose(self.submap_count)
-                
-                # Align all frames in the submap to the optimized anchor
-                for j in range(self.window_size):
-                    # We apply the scale internally to the local pose
-                    local_scaled = poses[j].copy()
-                    local_scaled[:3, 3] *= scale_diff
-                    
-                    global_pose = optimized_submap_anchor @ local_scaled
-                    
-                    if j >= self.overlap:
-                        batch_depths.append(np.linalg.norm(scaled_incoming_pts[j], axis=-1))
-                        batch_rgbs.append(window_frames[j])
-                        batch_masks.append(window_masks[j])
-                        batch_poses.append(global_pose)
-                        
-                self.prev_overlap_raw_pts = scaled_incoming_pts[-self.overlap:]
-                self.prev_overlap_local_poses = poses[-self.overlap:]
 
-            # --- 2. ASYNC DISPATCH ---
+            # --- 5. FINALIZE GLOBAL POSES ---
+            optimized_anchor = self.pose_graph.get_optimized_pose(self.submap_count)
+            batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
+            
+            for j in range(self.window_size):
+                # Multiply the Canonical Local Pose by the Optimized Global Anchor
+                global_pose = optimized_anchor @ canonical_poses[j]
+                
+                # Uprightness check to prevent the camera from accidentally flipping upside down
+                if global_pose[1, 1] < 0:
+                    flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+                    global_pose[:3, :3] = global_pose[:3, :3] @ flip_R
+
+                # Scale the depth map identically to how we scaled the pose
+                scaled_pts = pts_list[j] * self.current_metric_scale
+                depth_map = np.linalg.norm(scaled_pts, axis=-1)
+                
+                # Skip duplicate processing of overlap frames
+                if j >= (0 if self.is_first_window else self.overlap):
+                    batch_depths.append(depth_map)
+                    batch_rgbs.append(window_frames[j])
+                    batch_masks.append(window_masks[j])
+                    batch_poses.append(global_pose)
+                    
+                # Cache the global overlap for the next submap
+                if j >= self.window_size - self.overlap:
+                    if j == self.window_size - self.overlap:
+                        self.prev_overlap_global_poses = []
+                    self.prev_overlap_global_poses.append(global_pose)
+            
+            self.prev_overlap_raw_pts = pts_list[-self.overlap:]
+            self.is_first_window = False
+
+            # --- 6. ASYNC DISPATCH ---
             self.tsdf_future = self.tsdf_executor.submit(
                 self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
             )
