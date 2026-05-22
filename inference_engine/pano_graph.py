@@ -52,3 +52,4 @@ class PanoPoseGraph:
         if self.optimized_values.exists(node_id):
             return self.optimized_values.atPose3(node_id).matrix()
         return self.initial_estimates.atPose3(node_id).matrix()
+    

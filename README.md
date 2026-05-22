@@ -73,3 +73,10 @@ Whenever you execute scripts or run tests in this repository, prepend your comma
 # Example for future streaming evaluation execution
 uv run python demo.py --window_size 20 --overlap 5
 ```
+
+
+## Info
+
+This project started as a spinnoff of the original LASER codebase, adapted to work with panoramic video input.
+
+But during development we also made significant architectural changes to the original pipeline not using the architectural design of LASER, but instead implementing our tsdf and using part of the architectural design of [VGGT-Slam](https://github.com/MIT-SPARK/VGGT-SLAM)
