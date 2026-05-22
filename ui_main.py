@@ -81,26 +81,44 @@ def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_widt
     pcd = get_o3d_pcd(xyz_points, input_image, mask)
     return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), create_plotly_figure_from_pcd(pcd), save_pcd_to_ply(pcd, "single_frame")
 
-def process_sequence_ui(directory_path, decimation, zenith_limit, nadir_limit, target_width, target_height):
-    # Ensure path is cleaned
-    directory_path = directory_path.strip()
-    if not os.path.isdir(directory_path):
-        raise gr.Error(f"Invalid directory path: {directory_path}")
+# --- File Fetching & Decimation Logic ---
+def get_file_list(input_mode, uploaded_files, local_dir, decimation):
+    valid_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
+    files = []
     
-    valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
-    image_files = sorted([os.path.join(directory_path, f) for f in os.listdir(directory_path) 
-                          if f.lower().endswith(valid_exts)])
+    if input_mode == "Upload Files":
+        if uploaded_files:
+            # Gradio files have a .name attribute corresponding to the temp file path
+            files = sorted([f.name for f in uploaded_files])
+    else:
+        if local_dir and os.path.isdir(local_dir):
+            raw_files = os.listdir(local_dir)
+            files = sorted([os.path.join(local_dir, f) for f in raw_files if f.lower().endswith(valid_exts)])
+            
+    # Apply decimation (0 = take every file, 1 = skip 1 (take every 2nd file), etc.)
+    step = max(1, int(decimation) + 1)
+    return files[::step]
+
+def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
+    files = get_file_list(input_mode, uploaded_files, local_dir, decimation)
+    if not files:
+        return "⚠️ No valid images found or provided."
     
-    # Apply decimation
-    step = int(decimation)
-    image_files = image_files[::step]
+    # Extract basenames to keep the display clean
+    names = [os.path.basename(f) for f in files]
+    out = f"✅ Total files to process: {len(names)}\n\n"
+    out += "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
+    return out
+
+def process_sequence_ui(input_mode, uploaded_files, local_dir, decimation, zenith_limit, nadir_limit, target_width, target_height):
+    file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
     
-    if len(image_files) < 2:
-        raise gr.Error(f"Found only {len(image_files)} valid images in {directory_path}. Need at least 2.")
+    if not file_paths or len(file_paths) < 2:
+        raise gr.Error("Please ensure at least 2 valid images are provided after decimation.")
     
     frames = []
     masks = []
-    for f_path in image_files:
+    for f_path in file_paths:
         img_pil = Image.open(f_path).convert("RGB").resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
         img_np = np.array(img_pil)
         frames.append(img_np)
@@ -109,6 +127,12 @@ def process_sequence_ui(directory_path, decimation, zenith_limit, nadir_limit, t
 
     global_pcd = streaming_engine.process_sequence(frames, masks)
     return create_plotly_figure_from_pcd(global_pcd), save_pcd_to_ply(global_pcd, "global_stitched_map")
+
+def toggle_input_mode(mode):
+    if mode == "Upload Files":
+        return gr.update(visible=True), gr.update(visible=False)
+    else:
+        return gr.update(visible=False), gr.update(visible=True)
 
 # --- Gradio UI Layout ---
 with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine") as demo:
@@ -141,9 +165,24 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
                     download_single = gr.File(label="💾 Download Frame .ply")
                 
                 with gr.Tab("2. Multi-Frame 4D Stitching"):
-                    dir_input = gr.Textbox(label="Enter Directory Path on Server", placeholder="/root/PanoLASER/examples")
-                    decimation_input = gr.Number(value=1, label="Decimation (Skip rate)", minimum=1, step=1)
-                    run_seq_btn = gr.Button("Align & Stitch Directory", variant="primary")
+                    gr.Markdown("Select your source type. You can either drag & drop files, or provide a local server directory path.")
+                    
+                    input_mode = gr.Radio(choices=["Upload Files", "Local Directory Path"], value="Upload Files", label="Input Mode")
+                    
+                    # File inputs
+                    input_seq = gr.File(label="Upload Image Sequence (Drag & Drop)", file_count="multiple", file_types=["image"], visible=True)
+                    local_dir_input = gr.Textbox(label="Absolute Local Directory Path (e.g., /app/data/sequence1)", visible=False)
+                    
+                    # File parsing rules
+                    with gr.Row():
+                        decimation_input = gr.Number(value=0, label="Decimation (Skip N files)", precision=0, info="0 = keep all. 1 = skip every 1 file (take 1/2), 2 = skip 2 files, etc.")
+                        check_files_btn = gr.Button("Check Files & Preview Queue")
+                    
+                    # Output list for the check phase
+                    checked_files_output = gr.Textbox(label="Files to be Processed", interactive=False, lines=5)
+                    
+                    # Action buttons
+                    run_seq_btn = gr.Button("Align & Stitch Sequence", variant="primary")
                     output_3d_seq = gr.Plot(label="Global Stitched Map")
                     download_seq = gr.File(label="💾 Download Global .ply")
 
@@ -152,6 +191,17 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
     target_height.release(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'h'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
     link_ratio.change(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
     step_size.change(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
+
+    # Wire up Input Modes
+    input_mode.change(fn=toggle_input_mode, inputs=input_mode, outputs=[input_seq, local_dir_input])
+
+    # Wire up Check Files
+    check_files_btn.click(
+        fn=check_files_ui,
+        inputs=[input_mode, input_seq, local_dir_input, decimation_input],
+        outputs=[checked_files_output],
+        api_name=False
+    )
 
     run_single_btn.click(
         fn=process_single_frame,
@@ -162,7 +212,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
     
     run_seq_btn.click(
         fn=process_sequence_ui,
-        inputs=[dir_input, decimation_input, zenith_slider, nadir_slider, target_width, target_height],
+        inputs=[input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, target_width, target_height],
         outputs=[output_3d_seq, download_seq],
         api_name=False
     )
