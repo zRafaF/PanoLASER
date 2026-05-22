@@ -60,10 +60,10 @@ class FastStaticTSDF:
         
         valid_blocks_cpu = valid_blocks.cpu().numpy()
         
-        # 2. Pool Assignment
+        # 2. Pool Assignment (Fixing the PyTorch List Warning!)
         active_indices = []
-        valid_blocks_list = []
-        for row in valid_blocks_cpu:
+        kept_indices = []
+        for i, row in enumerate(valid_blocks_cpu):
             k = tuple(row)
             if k not in self.block_hash:
                 if self.next_idx >= self.max_blocks:
@@ -71,17 +71,16 @@ class FastStaticTSDF:
                 self.block_hash[k] = self.next_idx
                 self.next_idx += 1
             active_indices.append(self.block_hash[k])
-            valid_blocks_list.append(row)
+            kept_indices.append(i)  # Keep the index, not the array
             
         if not active_indices: return
         
-        valid_blocks_tensor = torch.tensor(valid_blocks_list, dtype=torch.float32, device=self.device)
+        # Slice the tensor directly, bypassing list conversion completely!
+        valid_blocks_tensor = valid_blocks[kept_indices]
         B_total = len(active_indices)
         
-        # --- THE FIX: MATH CHUNKING TO PREVENT TRANSIENT OOM ---
-        chunk_size = 256 # Process ~1 Million voxels at a time
+        chunk_size = 256
         
-        # Pre-compute inverted pose to save time inside loop
         pose_inv = torch.linalg.inv(pose)
         pose_inv_R = pose_inv[:3, :3].T
         pose_inv_t = pose_inv[:3, 3]
@@ -98,13 +97,11 @@ class FastStaticTSDF:
             N = self.voxels_per_block
             idx_tensor = torch.tensor(chunk_idx, dtype=torch.long, device=self.device)
             
-            # Gather
             old_tsdf = self.tsdf[idx_tensor].view(-1)
             old_w = self.weights[idx_tensor].view(-1)
             old_colors = self.colors[idx_tensor].view(-1, 3)
             old_min_dist = self.min_dist[idx_tensor].view(-1)
             
-            # Math
             offsets = chunk_blocks * self.block_size
             world_coords = (self.block_template.unsqueeze(0) + offsets.unsqueeze(1)).view(B * N, 3)
             
@@ -138,21 +135,24 @@ class FastStaticTSDF:
                 old_colors[color_update_mask] = sampled_rgb[color_update_mask]
                 old_min_dist[color_update_mask] = r[color_update_mask]
                 
-            # Scatter Back
             self.tsdf[idx_tensor] = old_tsdf.view(B, N)
             self.weights[idx_tensor] = old_w.view(B, N)
             self.colors[idx_tensor] = old_colors.view(B, N, 3)
             self.min_dist[idx_tensor] = old_min_dist.view(B, N)
             
-        print(f"      [Profile - TSDF] VRAM Math: Processed {B_total} blocks ({B_total*self.voxels_per_block/1e6:.1f}M voxels) in {time.time() - t_start:.4f} sec")
+        # Optional sync inside TSDF class to get exact integration time per frame
+        # torch.cuda.synchronize()
+        # print(f"      [Profile - TSDF] VRAM Math: Processed {B_total} blocks ({B_total*self.voxels_per_block/1e6:.1f}M voxels) in {time.time() - t_start:.4f} sec")
 
-    def extract_point_cloud(self):
+    # [FIX] Added surface_threshold argument to prevent TypeError
+    def extract_point_cloud(self, surface_threshold=None):
         t_start = time.time()
         
         if self.next_idx == 0:
             return o3d.geometry.PointCloud()
             
-        surface_threshold = self.voxel_size * 2.0 
+        if surface_threshold is None:
+            surface_threshold = self.voxel_size * 2.0 
         
         tsdf_vals = self.tsdf[:self.next_idx]
         weights = self.weights[:self.next_idx]
