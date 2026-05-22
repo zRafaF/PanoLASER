@@ -6,7 +6,6 @@ import tempfile
 import os
 from PIL import Image
 
-# Import our architecture
 from pano_wrapper import PanoVGGTExtractor
 from inference_engine.vanilla_engine import PanoVanillaEngine
 from inference_engine.streaming_window_engine import PanoStreamingEngine
@@ -20,6 +19,7 @@ base_model_wrapper = PanoVGGTExtractor()
 vanilla_engine = PanoVanillaEngine(base_model_wrapper.model)
 streaming_engine = PanoStreamingEngine(vanilla_engine, window_size=3, overlap=2)
 
+
 def get_o3d_pcd(xyz_points, rgb_image, mask):
     valid_mask = mask.astype(bool)
     points_filtered = xyz_points[valid_mask]
@@ -29,11 +29,13 @@ def get_o3d_pcd(xyz_points, rgb_image, mask):
     pcd.colors = o3d.utility.Vector3dVector(colors_filtered)
     return pcd
 
+
 def save_pcd_to_ply(pcd, prefix="reconstruction"):
     temp_dir = tempfile.mkdtemp()
     ply_path = os.path.join(temp_dir, f"{prefix}.ply")
     o3d.io.write_point_cloud(ply_path, pcd)
     return ply_path
+
 
 def create_plotly_figure_from_pcd(pcd, max_points=150000):
     points = np.asarray(pcd.points)
@@ -41,96 +43,141 @@ def create_plotly_figure_from_pcd(pcd, max_points=150000):
     if len(points) > max_points:
         idx = np.random.choice(len(points), max_points, replace=False)
         points, colors = points[idx], colors[idx]
-        
+
     colors_str = [f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in colors]
     fig = go.Figure(data=[go.Scatter3d(
         x=points[:, 0], y=points[:, 2], z=-points[:, 1],
         mode='markers', marker=dict(size=1.5, color=colors_str, opacity=1.0)
     )])
-    fig.update_layout(scene=dict(aspectmode='data', xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)), margin=dict(l=0, r=0, b=0, t=0), paper_bgcolor="#111111")
+    fig.update_layout(
+        scene=dict(
+            aspectmode='data',
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False)
+        ),
+        margin=dict(l=0, r=0, b=0, t=0),
+        paper_bgcolor="#111111"
+    )
     return fig
+
 
 def enforce_resolution(w, h, step, link, trigger):
     step = max(1, int(step))
     if link:
-        if trigger == 'w': h = w / 2.0
-        elif trigger == 'h': w = h * 2.0
+        if trigger == 'w':
+            h = w / 2.0
+        elif trigger == 'h':
+            w = h * 2.0
     w_snap = int(round(w / step) * step)
     h_snap = int(round(h / step) * step)
     actual_ratio = w_snap / h_snap if h_snap > 0 else 0
     error = abs(2.0 - actual_ratio)
-    msg = f"📐 **Processing Dimensions:** {w_snap} $\\times$ {h_snap} | **Target Ratio:** 2.0 | **Actual:** {actual_ratio:.4f} | **Error:** {error:.4f}"
+    msg = (
+        f"📐 **Processing Dimensions:** {w_snap} $\\times$ {h_snap} | "
+        f"**Target Ratio:** 2.0 | **Actual:** {actual_ratio:.4f} | **Error:** {error:.4f}"
+    )
     return w_snap, h_snap, msg
 
+
 def process_single_frame(input_image_pil, zenith_limit, nadir_limit, target_width, target_height):
-    if input_image_pil is None: return None, None, None, None
-    input_image_pil = input_image_pil.resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
+    if input_image_pil is None:
+        return None, None, None, None
+    input_image_pil = input_image_pil.resize(
+        (int(target_width), int(target_height)), Image.Resampling.LANCZOS
+    )
     input_image = np.array(input_image_pil)
     H, W = input_image.shape[:2]
-    
+
     mask = get_spherical_valid_mask(H, W, zenith_deg=zenith_limit, nadir_deg=nadir_limit)
     masked_rgb_vis = visualize_polar_mask(input_image, mask)
-    
+
     preds = base_model_wrapper.process_frame(input_image)
     depth_map = preds["depth"]
-    
+
     xyz_points = unproject_equirectangular_to_points(np.squeeze(depth_map))
     depth_map[~mask] = 0.0
     depth_vis = visualize_depth(depth_map)
-    
+
     pcd = get_o3d_pcd(xyz_points, input_image, mask)
-    return Image.fromarray(masked_rgb_vis), Image.fromarray(depth_vis), create_plotly_figure_from_pcd(pcd), save_pcd_to_ply(pcd, "single_frame")
+    return (
+        Image.fromarray(masked_rgb_vis),
+        Image.fromarray(depth_vis),
+        create_plotly_figure_from_pcd(pcd),
+        save_pcd_to_ply(pcd, "single_frame"),
+    )
+
 
 # --- File Fetching & Decimation Logic ---
 def get_file_list(input_mode, uploaded_files, local_dir, decimation):
     valid_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
     files = []
-    
+
     if input_mode == "Upload Files":
         if uploaded_files:
-            # Gradio files have a .name attribute corresponding to the temp file path
+            # Gradio file objects expose their temp path via .name
             files = sorted([f.name for f in uploaded_files])
     else:
         if local_dir and os.path.isdir(local_dir):
             raw_files = os.listdir(local_dir)
-            files = sorted([os.path.join(local_dir, f) for f in raw_files if f.lower().endswith(valid_exts)])
-            
-    # Apply decimation (0 = take every file, 1 = skip 1 (take every 2nd file), etc.)
+            files = sorted([
+                os.path.join(local_dir, f)
+                for f in raw_files
+                if f.lower().endswith(valid_exts)
+            ])
+
+    # Apply decimation (0 = keep all, 1 = take every 2nd, etc.)
     step = max(1, int(decimation) + 1)
     return files[::step]
+
 
 def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
     files = get_file_list(input_mode, uploaded_files, local_dir, decimation)
     if not files:
         return "⚠️ No valid images found or provided."
-    
-    # Extract basenames to keep the display clean
+
     names = [os.path.basename(f) for f in files]
     out = f"✅ Total files to process: {len(names)}\n\n"
-    out += "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
+    out += "\n".join(f"{i + 1}. {n}" for i, n in enumerate(names))
     return out
 
-def process_sequence_ui(image_files, zenith_limit, nadir_limit, target_width, target_height, window_size, overlap):
-    if not image_files or len(image_files) < 2:
-        raise gr.Error("Please upload at least 2 images.")
-    
-    image_files = sorted(image_files, key=lambda x: x.name)
-    
-    frames = []
-    masks = []
-    for f in image_files:
-        img_pil = Image.open(f.name).convert("RGB").resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
+
+# FIX: accepts input_mode / local_dir / decimation so both modes work
+def process_sequence_ui(
+    input_mode, uploaded_files, local_dir, decimation,
+    zenith_limit, nadir_limit,
+    target_width, target_height,
+    window_size, overlap,
+):
+    file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
+
+    if not file_paths or len(file_paths) < 2:
+        raise gr.Error(
+            "Please provide at least 2 valid images "
+            "(upload files or point to a local directory with images)."
+        )
+
+    frames, masks = [], []
+    for path in file_paths:
+        img_pil = (
+            Image.open(path)
+            .convert("RGB")
+            .resize((int(target_width), int(target_height)), Image.Resampling.LANCZOS)
+        )
         img_np = np.array(img_pil)
         frames.append(img_np)
-        mask = get_spherical_valid_mask(img_np.shape[0], img_np.shape[1], zenith_deg=zenith_limit, nadir_deg=nadir_limit)
+        mask = get_spherical_valid_mask(
+            img_np.shape[0], img_np.shape[1],
+            zenith_deg=zenith_limit, nadir_deg=nadir_limit,
+        )
         masks.append(mask)
 
-    # Re-configure engine variables dynamically per UI run
     streaming_engine.window_size = int(window_size)
     streaming_engine.overlap = int(overlap)
 
     global_pcd = streaming_engine.process_sequence(frames, masks)
     return create_plotly_figure_from_pcd(global_pcd), save_pcd_to_ply(global_pcd, "global_stitched_map")
+
 
 def toggle_input_mode(mode):
     if mode == "Upload Files":
@@ -138,30 +185,33 @@ def toggle_input_mode(mode):
     else:
         return gr.update(visible=False), gr.update(visible=True)
 
+
 # --- Gradio UI Layout ---
 with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine") as demo:
     gr.Markdown("# 🌐 PanoLASER: Alignment & Streaming Sandbox")
-    
+
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("### Processing Controls")
             with gr.Row():
                 step_size = gr.Number(value=14, label="Step Size")
                 link_ratio = gr.Checkbox(value=True, label="Link Aspect Ratio")
-                
+
             target_width = gr.Slider(minimum=224, maximum=4096, value=1036, step=1, label="Target Width")
             target_height = gr.Slider(minimum=112, maximum=2048, value=518, step=1, label="Target Height")
-            ratio_info = gr.Markdown("📐 **Processing Dimensions:** 1036 $\\times$ 518 | **Target Ratio:** 2.0 | **Actual:** 2.0000 | **Error:** 0.0000")
-            
+            ratio_info = gr.Markdown(
+                "📐 **Processing Dimensions:** 1036 $\\times$ 518 | "
+                "**Target Ratio:** 2.0 | **Actual:** 2.0000 | **Error:** 0.0000"
+            )
+
             gr.Markdown("### Polar Exclusion Limits")
             zenith_slider = gr.Slider(minimum=0, maximum=90, value=75, step=1, label="Zenith Limit")
             nadir_slider = gr.Slider(minimum=-90, maximum=0, value=-60, step=1, label="Nadir Limit")
 
-            # Add these sliders right beneath the nadir slider:
             gr.Markdown("### Submap Configuration (SLAM)")
             window_size_slider = gr.Slider(minimum=3, maximum=32, value=16, step=1, label="Submap Window Size (Frames Batch)")
             overlap_slider = gr.Slider(minimum=2, maximum=8, value=4, step=1, label="Submap Frame Overlap")
-            
+
         with gr.Column(scale=2):
             with gr.Tabs():
                 with gr.Tab("1. Single Frame Extract"):
@@ -172,61 +222,98 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
                         output_depth = gr.Image(label="Depth Map", type="pil")
                     output_3d_single = gr.Plot(label="Single Frame Point Cloud")
                     download_single = gr.File(label="💾 Download Frame .ply")
-                
+
                 with gr.Tab("2. Multi-Frame 4D Stitching"):
-                    gr.Markdown("Select your source type. You can either drag & drop files, or provide a local server directory path.")
-                    
-                    input_mode = gr.Radio(choices=["Upload Files", "Local Directory Path"], value="Upload Files", label="Input Mode")
-                    
-                    # File inputs
-                    input_seq = gr.File(label="Upload Image Sequence (Drag & Drop)", file_count="multiple", file_types=["image"], visible=True)
-                    local_dir_input = gr.Textbox(label="Absolute Local Directory Path (e.g., /app/data/sequence1)", visible=False)
-                    
-                    # File parsing rules
+                    gr.Markdown(
+                        "Select your source type. You can either drag & drop files, "
+                        "or provide a local server directory path."
+                    )
+
+                    input_mode = gr.Radio(
+                        choices=["Upload Files", "Local Directory Path"],
+                        value="Upload Files",
+                        label="Input Mode",
+                    )
+
+                    input_seq = gr.File(
+                        label="Upload Image Sequence (Drag & Drop)",
+                        file_count="multiple",
+                        file_types=["image"],
+                        visible=True,
+                    )
+                    local_dir_input = gr.Textbox(
+                        label="Absolute Local Directory Path (e.g., /app/data/sequence1)",
+                        visible=False,
+                    )
+
                     with gr.Row():
-                        decimation_input = gr.Number(value=0, label="Decimation (Skip N files)", precision=0, info="0 = keep all. 1 = skip every 1 file (take 1/2), 2 = skip 2 files, etc.")
+                        decimation_input = gr.Number(
+                            value=0, label="Decimation (Skip N files)", precision=0,
+                            info="0 = keep all. 1 = skip every 1 file (take 1/2), 2 = skip 2 files, etc."
+                        )
                         check_files_btn = gr.Button("Check Files & Preview Queue")
-                    
-                    # Output list for the check phase
-                    checked_files_output = gr.Textbox(label="Files to be Processed", interactive=False, lines=5)
-                    
-                    # Action buttons
+
+                    checked_files_output = gr.Textbox(
+                        label="Files to be Processed", interactive=False, lines=5
+                    )
+
                     run_seq_btn = gr.Button("Align & Stitch Sequence", variant="primary")
                     output_3d_seq = gr.Plot(label="Global Stitched Map")
                     download_seq = gr.File(label="💾 Download Global .ply")
 
-    # Wire up resolutions
-    target_width.release(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
-    target_height.release(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'h'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
-    link_ratio.change(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
-    step_size.change(fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'), inputs=[target_width, target_height, step_size, link_ratio], outputs=[target_width, target_height, ratio_info])
+    # --- Wire-ups ---
+    target_width.release(
+        fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
+        inputs=[target_width, target_height, step_size, link_ratio],
+        outputs=[target_width, target_height, ratio_info],
+    )
+    target_height.release(
+        fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'h'),
+        inputs=[target_width, target_height, step_size, link_ratio],
+        outputs=[target_width, target_height, ratio_info],
+    )
+    link_ratio.change(
+        fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
+        inputs=[target_width, target_height, step_size, link_ratio],
+        outputs=[target_width, target_height, ratio_info],
+    )
+    step_size.change(
+        fn=lambda w, h, s, l: enforce_resolution(w, h, s, l, 'w'),
+        inputs=[target_width, target_height, step_size, link_ratio],
+        outputs=[target_width, target_height, ratio_info],
+    )
 
-    # Wire up Input Modes
-    input_mode.change(fn=toggle_input_mode, inputs=input_mode, outputs=[input_seq, local_dir_input])
+    input_mode.change(
+        fn=toggle_input_mode,
+        inputs=input_mode,
+        outputs=[input_seq, local_dir_input],
+    )
 
-    # Wire up Check Files
     check_files_btn.click(
         fn=check_files_ui,
         inputs=[input_mode, input_seq, local_dir_input, decimation_input],
         outputs=[checked_files_output],
-        api_name=False
+        api_name=False,
     )
 
     run_single_btn.click(
         fn=process_single_frame,
         inputs=[input_img, zenith_slider, nadir_slider, target_width, target_height],
         outputs=[output_rgb, output_depth, output_3d_single, download_single],
-        api_name=False
+        api_name=False,
     )
-    
+
+    # FIX: pass all four source-selection inputs first, then the processing params
     run_seq_btn.click(
         fn=process_sequence_ui,
         inputs=[
-            input_seq, zenith_slider, nadir_slider, target_width, target_height,
-            window_size_slider, overlap_slider
+            input_mode, input_seq, local_dir_input, decimation_input,
+            zenith_slider, nadir_slider,
+            target_width, target_height,
+            window_size_slider, overlap_slider,
         ],
         outputs=[output_3d_seq, download_seq],
-        api_name=False
+        api_name=False,
     )
 
 if __name__ == "__main__":
