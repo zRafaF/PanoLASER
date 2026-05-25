@@ -41,12 +41,11 @@ Run the following command. `uv` will automatically pull Python 3.11 (the require
 uv sync
 ```
 
-<!-- **NOTE**
-To run in instances that already have cuda torch and some other dependencies you can use the following command.
-
-```bash
-uv pip install --system -e .
-``` -->
+> [!TIP]
+> *Windows Users:* The `gtsam` package does not natively support Windows wheels. If you are developing on Windows and running scripts that don't rely on `gtsam`, bypass its installation by running:
+> ```bash
+> uv sync --no-install-package gtsam
+> ```
 
 ### 3. Compile Cython Modules
 
@@ -73,6 +72,12 @@ Whenever you execute scripts or run tests in this repository, prepend your comma
 # Example for future streaming evaluation execution
 uv run python demo.py --window_size 20 --overlap 5
 ```
+
+> [!TIP]
+> *Windows Users:* Because `uv run` automatically validates the environment against the lockfile, it will fail if `gtsam` is missing. To execute lightweight standalone scripts (like frame splitting) on Windows without triggering environment checks, add the `--no-sync` flag:
+> ```bash
+> uv run --no-sync .\scripts\splitframes.py
+> ```
 
 
 ## Info

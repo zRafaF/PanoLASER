@@ -4,10 +4,10 @@ import os
 def extract_mask_and_compress_frames(
     video_path="video.mp4",
     output_folder="examples",
-    nadir_degrees=-60,
+    nadir_degrees=-70,
     zenith_degrees=75,
     mode="black",
-    target_fps=5,
+    target_fps=3,
     jpeg_quality=80,
     output_width=1036,
     output_height=518
@@ -101,10 +101,10 @@ if __name__ == "__main__":
     extract_mask_and_compress_frames(
         video_path="video.mp4",
         output_folder="examples",
-        nadir_degrees=-60,
+        nadir_degrees=-70,
         zenith_degrees=75,
         mode="black",
-        target_fps=5,
+        target_fps=3,
         jpeg_quality=100,
         output_width=1036,
         output_height=518
