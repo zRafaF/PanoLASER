@@ -242,7 +242,7 @@ class StreamingWindowEngineLC:
         
         final_mesh = self.tsdf.extract_mesh(surface_threshold=0.02)
         
-        # Pass viz_voxel_scale=1.5 for the final dense point cloud export (3cm resolution)
-        final_pcd = self.tsdf.extract_point_cloud(surface_threshold=0.02, viz_voxel_scale=1.5)
+        # Pass viz_voxel_scale=1.5 for the final dense point cloud export (2cm resolution)
+        final_pcd = self.tsdf.extract_point_cloud(surface_threshold=0.02, viz_voxel_scale=1.0)
         
         yield final_mesh, final_pcd, np.array(trajectory), lc_edges

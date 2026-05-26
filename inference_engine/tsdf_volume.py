@@ -256,18 +256,28 @@ class FastStaticTSDF:
         mesh.vertices = o3d.utility.Vector3dVector(verts_world)
         mesh.triangles = o3d.utility.Vector3iVector(faces)
         
-        # --- FIX 2: Explicit Normal Calculation for UI Visualizer ---
+        # --- FIX 1: Quadric Mesh Decimation ---
+        # 1 Million triangles creates a beautiful, sharp room that sits around 50MB. 
+        initial_triangles = len(mesh.triangles)
+        target_triangles = 1000000 
+        
+        if initial_triangles > target_triangles:
+            print(f"      [Profile - Extraction] Decimating flat surfaces: {initial_triangles} -> {target_triangles} triangles...")
+            mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target_triangles)
+        
+        # Calculate normals AFTER decimation for smooth rendering
         mesh.compute_vertex_normals()
         
         print("      [Profile - Extraction] Colorizing Mesh via Vectorized cKDTree...")
-        # Get raw high-density colors directly from the TSDF for perfect texturing
         pcd = self.extract_point_cloud(surface_threshold=self.voxel_size * 2, viz_voxel_scale=1.0)
         pcd_verts = np.asarray(pcd.points)
         pcd_colors = np.asarray(pcd.colors)
         
-        if len(pcd_verts) > 0:
+        # We query the KDTree against the newly decimated vertices
+        verts_world_decimated = np.asarray(mesh.vertices)
+        if len(pcd_verts) > 0 and len(verts_world_decimated) > 0:
             tree = cKDTree(pcd_verts)
-            _, idx = tree.query(verts_world, k=1)
+            _, idx = tree.query(verts_world_decimated, k=1)
             mesh.vertex_colors = o3d.utility.Vector3dVector(pcd_colors[idx])
         
         print(f"      [Profile - Extraction] Final Mesh extracted in {time.time() - t_start:.4f} sec")
