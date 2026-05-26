@@ -232,15 +232,17 @@ class StreamingWindowEngineLC:
             trajectory = [self.pose_graph.get_optimized_pose(k)[:3, 3] for k in range(self.submap_count)]
             lc_edges = [(self.pose_graph.get_optimized_pose(f)[:3, 3], self.pose_graph.get_optimized_pose(t)[:3, 3]) for f, t in self.loop_closures]
             
-            # Extract fast PyTorch Point Cloud (Sub-sampled to max 250k points for instant visualization)
-            live_pcd = self.tsdf.extract_point_cloud(surface_threshold=0.02, max_points=250000)
+            # Pass viz_voxel_scale=4.0 to stream a fast, sparse preview (8cm resolution)
+            live_pcd = self.tsdf.extract_point_cloud(surface_threshold=0.02, viz_voxel_scale=4.0)
             
             yield None, live_pcd, np.array(trajectory), lc_edges
 
         # --- END OF SEQUENCE: EXPORT MESH ---
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
         
-        # Only run the heavy CPU Poisson meshing once at the very end
-        final_mesh = self.tsdf.extract_mesh(surface_threshold=0.02, poisson_depth=8)
+        final_mesh = self.tsdf.extract_mesh(surface_threshold=0.02)
         
-        yield final_mesh, live_pcd, np.array(trajectory), lc_edges
+        # Pass viz_voxel_scale=1.5 for the final dense point cloud export (3cm resolution)
+        final_pcd = self.tsdf.extract_point_cloud(surface_threshold=0.02, viz_voxel_scale=1.5)
+        
+        yield final_mesh, final_pcd, np.array(trajectory), lc_edges

@@ -38,6 +38,10 @@ def save_pcd_to_ply(pcd, prefix="reconstruction"):
 
 
 def save_mesh_to_glb(mesh, prefix="reconstruction"):
+    # Failsafe: Gradio will crash if fed an empty GLB file
+    if len(mesh.vertices) == 0:
+        return None
+        
     temp_dir = tempfile.mkdtemp()
     glb_path = os.path.join(temp_dir, f"{prefix}.glb")
     o3d.io.write_triangle_mesh(glb_path, mesh)
@@ -238,18 +242,15 @@ def process_sequence_ui(
     streaming_engine.window_size = int(window_size)
     streaming_engine.overlap = int(overlap)
 
-    # --- FIX: Loop over the generator for live streaming ---
     for mesh, global_pcd, trajectory, lc_edges in streaming_engine.process_sequence(frames, masks):
         
-        # Render the live point cloud and trajectory
         fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, lc_edges)
         pcd_path = save_pcd_to_ply(global_pcd, "live_stitched_map")
         
-        # If the mesh is None (during the stream), use gr.skip() to tell Gradio not to update those UI elements yet
         if mesh is None:
-            yield fig, pcd_path, gr.skip(), gr.skip()
+            # Yield None instead of gr.skip() so Gradio initializes the container safely
+            yield fig, pcd_path, None, None
         else:
-            # The sequence has finished, export and display the final GLB mesh
             mesh_path = save_mesh_to_glb(mesh, "final_stitched_mesh")
             yield fig, pcd_path, mesh_path, mesh_path
 
