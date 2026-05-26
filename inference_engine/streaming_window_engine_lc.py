@@ -182,11 +182,11 @@ class StreamingWindowEngineLC:
                         if abs(odom_dist - lc_dist) < 0.75:
                             self.pose_graph.add_loop_closure(best_match_id, self.submap_count, T_relative_anchors)
                             self.loop_closures.append((best_match_id, self.submap_count))
-                            print(f"  [SLAM] ✅ LOOP APPLIED (Scale: {lc_scale:.2f}, Drift Corrected: {abs(odom_dist - lc_dist):.2f}m)")
+                            print(f"  [SLAM] ✅ LOOP APPLIED")
                         else:
-                            print(f"  [SLAM] 🟡 LOOP REJECTED (Spatial Hallucination: {lc_dist:.2f}m vs Odom {odom_dist:.2f}m)")
+                            print(f"  [SLAM] 🟡 LOOP REJECTED (Spatial Hallucination)")
                     else:
-                        print(f"  [SLAM] 🟡 LOOP REJECTED (Scale Hallucination: {lc_scale:.2f})")
+                        print(f"  [SLAM] 🟡 LOOP REJECTED (Scale Hallucination)")
                         
                 self.pose_graph.optimize()
 
@@ -225,25 +225,22 @@ class StreamingWindowEngineLC:
             self.submap_count += 1
             print(f"  [Profile] Cycle Time: {time.time() - t_win_start:.4f} sec")
 
-        if self.tsdf_future is not None:
-            self.tsdf_future.result()
+            # --- GPU STREAM YIELD ---
+            if self.tsdf_future is not None:
+                self.tsdf_future.result()
 
+            trajectory = [self.pose_graph.get_optimized_pose(k)[:3, 3] for k in range(self.submap_count)]
+            lc_edges = [(self.pose_graph.get_optimized_pose(f)[:3, 3], self.pose_graph.get_optimized_pose(t)[:3, 3]) for f, t in self.loop_closures]
+            
+            # Extract fast PyTorch Point Cloud (Sub-sampled to max 250k points for instant visualization)
+            live_pcd = self.tsdf.extract_point_cloud(surface_threshold=0.02, max_points=250000)
+            
+            yield None, live_pcd, np.array(trajectory), lc_edges
+
+        # --- END OF SEQUENCE: EXPORT MESH ---
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
         
-        trajectory = []
-        for i in range(self.submap_count):
-            pose = self.pose_graph.get_optimized_pose(i)
-            trajectory.append(pose[:3, 3]) 
-            
-        lc_edges = []
-        for (from_id, to_id) in self.loop_closures:
-            p1 = self.pose_graph.get_optimized_pose(from_id)[:3, 3]
-            p2 = self.pose_graph.get_optimized_pose(to_id)[:3, 3]
-            lc_edges.append((p1, p2))
-            
-        # --- NEW: Extracting both Mesh and PCD ---
-        surface_thresh = 0.02
-        pcd = self.tsdf.extract_point_cloud(surface_threshold=surface_thresh)
-        mesh = self.tsdf.extract_mesh(surface_threshold=surface_thresh, poisson_depth=9)
+        # Only run the heavy CPU Poisson meshing once at the very end
+        final_mesh = self.tsdf.extract_mesh(surface_threshold=0.02, poisson_depth=8)
         
-        return mesh, pcd, np.array(trajectory), lc_edges
+        yield final_mesh, live_pcd, np.array(trajectory), lc_edges

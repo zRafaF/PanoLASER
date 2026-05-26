@@ -23,6 +23,8 @@ class FastStaticTSDF:
         self.min_dist = torch.full((max_blocks, self.voxels_per_block), float('inf'), dtype=torch.float32, device=self.device)
         
         self.block_hash = {}
+        # --- GPU Optimization: Track coordinates in a tensor to avoid slow list(keys) conversions ---
+        self.block_coords_tensor = torch.zeros((max_blocks, 3), dtype=torch.long, device=self.device)
         self.next_idx = 0
         
         x = torch.arange(self.block_res, device=self.device)
@@ -31,8 +33,6 @@ class FastStaticTSDF:
 
     @torch.no_grad()
     def integrate(self, depth_map, rgb_image, mask, pose):
-        t_start = time.time()
-        
         if isinstance(depth_map, np.ndarray):
             depth_map = torch.from_numpy(depth_map.copy()).float().to(self.device)
             mask = torch.from_numpy(mask.copy()).float().to(self.device)
@@ -41,12 +41,10 @@ class FastStaticTSDF:
             
         C = pose[:3, 3]
         
-        # --- NEW: SURFACE-GUIDED SPARSE ALLOCATION ---
-        # 1. Downsample depth map to speed up raycasting (skip every 8 pixels)
+        # Surface-Guided Sparse Allocation
         skip = 8
         d_small = depth_map[::skip, ::skip]
         
-        # 2. Generate equirectangular rays matching your panoramic projection
         H, W = d_small.shape
         v_norm = torch.linspace(-1, 1, H, device=self.device)
         u_norm = torch.linspace(-1, 1, W, device=self.device)
@@ -60,26 +58,21 @@ class FastStaticTSDF:
         Z_ray = torch.cos(phi) * torch.cos(theta)
         rays = torch.stack([X_ray, Y_ray, Z_ray], dim=-1) 
         
-        # 3. Filter to valid points within mapping range
         valid = (d_small > 0.1) & (d_small < self.max_depth)
         valid_rays = rays[valid]
         valid_depths = d_small[valid].unsqueeze(-1)
         
         cam_pts = valid_rays * valid_depths
-        
-        # 4. Transform to World Space
         pose_R = pose[:3, :3]
         world_pts = (cam_pts @ pose_R.T) + C
         
-        # 5. Add margin layers (front/back) to ensure we carve space correctly
         ray_dirs_world = valid_rays @ pose_R.T
         pts_front = world_pts - ray_dirs_world * self.margin
         pts_back = world_pts + ray_dirs_world * self.margin
         
         all_pts = torch.cat([world_pts, pts_front, pts_back], dim=0)
         
-        # 6. Hash to unique blocks (No more allocating empty air!)
-        block_coords = torch.floor(all_pts / self.block_size).int()
+        block_coords = torch.floor(all_pts / self.block_size).long()
         valid_blocks = torch.unique(block_coords, dim=0)
         
         valid_blocks_cpu = valid_blocks.cpu().numpy()
@@ -92,6 +85,8 @@ class FastStaticTSDF:
                 if self.next_idx >= self.max_blocks:
                     continue
                 self.block_hash[k] = self.next_idx
+                # Store natively on GPU
+                self.block_coords_tensor[self.next_idx] = valid_blocks[i]
                 self.next_idx += 1
             active_indices.append(self.block_hash[k])
             kept_indices.append(i) 
@@ -165,7 +160,8 @@ class FastStaticTSDF:
             self.colors[idx_tensor] = old_colors.view(B, N, 3)
             self.min_dist[idx_tensor] = old_min_dist.view(B, N)
 
-    def extract_point_cloud(self, surface_threshold=None):
+    def extract_point_cloud(self, surface_threshold=None, max_points=250000):
+        """Extracts the point cloud, aggressively downsampling on the GPU to maintain <1s stream speeds."""
         t_start = time.time()
         
         if self.next_idx == 0:
@@ -181,13 +177,20 @@ class FastStaticTSDF:
         valid = (torch.abs(physical_sdf) <= surface_threshold) & (weights > 0)
         
         b_idx, v_idx = torch.where(valid)
+        
         if len(b_idx) == 0:
             return o3d.geometry.PointCloud()
             
-        keys_list = list(self.block_hash.keys())
-        keys_tensor = torch.tensor(keys_list, device=self.device)
-        
-        valid_block_coords = keys_tensor[b_idx]
+        # --- GPU OPTIMIZATION: PyTorch Decimation ---
+        # Never send 17 million points to the CPU. Subsample directly on the GPU.
+        total_points = len(b_idx)
+        if total_points > max_points:
+            perm = torch.randperm(total_points, device=self.device)[:max_points]
+            b_idx = b_idx[perm]
+            v_idx = v_idx[perm]
+            
+        # Use our pre-allocated tensor instead of recreating it from the python dict
+        valid_block_coords = self.block_coords_tensor[b_idx]
         valid_local_coords = self.block_template[v_idx]
         
         coords = (valid_block_coords * self.block_size) + valid_local_coords
@@ -197,40 +200,37 @@ class FastStaticTSDF:
         pcd.points = o3d.utility.Vector3dVector(coords.cpu().numpy())
         pcd.colors = o3d.utility.Vector3dVector(colors.cpu().numpy())
         
-        print(f"      [Profile - Extraction] GPU Vector Extraction: {len(pcd.points)} points in {time.time() - t_start:.4f} sec")
+        print(f"      [Profile - Extraction] GPU Decimated Extraction: {len(pcd.points)} points in {time.time() - t_start:.4f} sec")
         return pcd
 
-    # --- NEW: MESH EXTRACTION ---
-    def extract_mesh(self, surface_threshold=None, poisson_depth=9):
+    def extract_mesh(self, surface_threshold=None, poisson_depth=8):
+        """Only called at the very end. Heavy CPU operation."""
         t_start = time.time()
-        pcd = self.extract_point_cloud(surface_threshold)
+        
+        # Extract a reasonably sized point cloud for meshing
+        pcd = self.extract_point_cloud(surface_threshold, max_points=1000000)
         
         if len(pcd.points) < 500:
-            print("      [Profile - Extraction] Not enough points to compute a valid mesh.")
             return o3d.geometry.TriangleMesh()
 
+        # Voxel downsample heavily smooths the surface for cleaner normals
+        pcd = pcd.voxel_down_sample(voxel_size=self.voxel_size * 2.5)
+
         print(f"      [Profile - Extraction] Estimating Normals for {len(pcd.points)} points...")
-        # Search radius scaled slightly above voxel size to ensure smooth normal interpolation
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 4.0, max_nn=30))
         pcd.orient_normals_consistent_tangent_plane(100)
 
         print("      [Profile - Extraction] Running Poisson Surface Reconstruction...")
-        # Depth 9 usually yields sharp room-scale geometry without excessive memory usage
         mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=poisson_depth)
 
-        print("      [Profile - Extraction] Cleaning up mesh artifacts...")
-        # Poisson algorithms close holes by creating a giant bubble around the scene.
-        # We trim away any vertices with low point-cloud density to reveal the true layout.
         densities = np.asarray(densities)
         density_threshold = np.quantile(densities, 0.05)
         vertices_to_remove = densities < density_threshold
         mesh.remove_vertices_by_mask(vertices_to_remove)
 
-        # Crop strictly to the mapped bounds
         bbox = pcd.get_axis_aligned_bounding_box()
         mesh = mesh.crop(bbox)
         
-        # Color interpolation based on closest points
         kd_tree = o3d.geometry.KDTreeFlann(pcd)
         mesh_vertices = np.asarray(mesh.vertices)
         pcd_colors = np.asarray(pcd.colors)
