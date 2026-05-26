@@ -43,6 +43,7 @@ class StreamingWindowEngineLC:
         # Loop closure memory banks
         self.lc_embeddings = {}
         self.lc_anchor_frames = {}
+        self.lc_mid_canonical_poses = {} # <-- FIX 1: Tracks the middle frame offset
         self.loop_closures = []
 
     def _is_keyframe(self, current_pose, trans_thresh=0.15, rot_thresh=5.0):
@@ -121,6 +122,9 @@ class StreamingWindowEngineLC:
                 
             submap_origin_inv = np.linalg.inv(metric_local_poses[0])
             canonical_poses = [submap_origin_inv @ mp for mp in metric_local_poses]
+            
+            # Store the canonical offset of the middle frame for Loop Closure math later
+            self.lc_mid_canonical_poses[self.submap_count] = canonical_poses[mid_idx]
 
             # --- 4. GTSAM GRAPH CONSTRUCTION ---
             if self.is_first_window:
@@ -151,17 +155,37 @@ class StreamingWindowEngineLC:
                             best_match_id = old_id
                 
                 if best_score > 0.85: 
-                    print(f"  [SLAM] 🟢 LOOP CLOSURE: Submap {self.submap_count} -> {best_match_id} (Score: {best_score:.3f})")
+                    print(f"  [SLAM] 🟢 LOOP DETECTED: Submap {self.submap_count} -> {best_match_id} (Score: {best_score:.3f})")
                     old_frame = self.lc_anchor_frames[best_match_id]
                     
-                    # Extract relative geometry directly from VGGT
+                    # Run VGGT on the isolated pair
                     lc_preds = self.engine(np.stack([old_frame, mid_frame]))
                     T_lc_raw = lc_preds["poses"][1] 
-                    T_lc_metric = T_lc_raw.copy()
-                    T_lc_metric[:3, 3] *= self.current_metric_scale
                     
-                    self.pose_graph.add_loop_closure(best_match_id, self.submap_count, T_lc_metric)
-                    self.loop_closures.append((best_match_id, self.submap_count))
+                    # --- FIX 2: Dynamic Metric Scaling for Loop Closure ---
+                    metric_current_pts = pts_list[mid_idx] * self.current_metric_scale
+                    lc_scale = align_cam_pts_irls(
+                        torch.from_numpy(lc_preds["points"][1].copy()), 
+                        torch.from_numpy(metric_current_pts.copy()), 
+                        torch.from_numpy(window_masks[mid_idx].copy())
+                    )
+                    
+                    # Sanity Guard: If VGGT struggled with the panoramic rotation, the scale will explode/collapse.
+                    if 0.1 < lc_scale < 10.0:
+                        T_lc_metric = T_lc_raw.copy()
+                        T_lc_metric[:3, 3] *= lc_scale
+                        
+                        # --- FIX 1: Anchor Node Math ---
+                        C_old = self.lc_mid_canonical_poses[best_match_id]
+                        C_new = self.lc_mid_canonical_poses[self.submap_count]
+                        
+                        T_relative_anchors = C_old @ T_lc_metric @ np.linalg.inv(C_new)
+                        
+                        self.pose_graph.add_loop_closure(best_match_id, self.submap_count, T_relative_anchors)
+                        self.loop_closures.append((best_match_id, self.submap_count))
+                        print(f"  [SLAM] ✅ LOOP APPLIED (Scale aligned: {lc_scale:.2f})")
+                    else:
+                        print(f"  [SLAM] 🟡 LOOP REJECTED (Neural Hallucination: Bad Scale {lc_scale:.2f})")
                 
                 self.pose_graph.optimize()
 
