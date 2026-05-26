@@ -143,9 +143,6 @@ class StreamingWindowEngineLC:
                             best_score = score
                             best_match_id = old_id
                 
-                # --- [FIX 1]: STRICTER VISUAL THRESHOLD FOR 360 IMAGES ---
-                # 360 images of the same room look very similar. Bump to 0.92 to ensure 
-                # we are actually standing in the exact same spot, not just the same room.
                 if best_score > 0.92: 
                     print(f"  [SLAM] 🟢 LOOP DETECTED: Submap {self.submap_count} -> {best_match_id} (Score: {best_score:.3f})")
                     old_frame = self.lc_anchor_frames[best_match_id]
@@ -160,13 +157,10 @@ class StreamingWindowEngineLC:
                         torch.from_numpy(window_masks[mid_idx].copy())
                     )
                     
-                    # --- [FIX 2]: CLAMP SCALE HALLUCINATIONS ---
-                    # Reject if IRLS suggests the depth maps are scaled wildly (> 2.5x)
                     if 0.5 < lc_scale < 2.5:
                         T_lc_metric = T_lc_raw.copy()
                         T_lc_metric[:3, 3] *= lc_scale
                         
-                        # Apply 4x4 matrix sandwich to correctly flip
                         if T_lc_metric[1, 1] < 0:
                             flip_4x4 = np.eye(4)
                             flip_4x4[1, 1] = -1
@@ -177,18 +171,14 @@ class StreamingWindowEngineLC:
                         C_new = self.lc_mid_canonical_poses[self.submap_count]
                         T_relative_anchors = C_old @ T_lc_metric @ np.linalg.inv(C_new)
                         
-                        # Neutralize Rotational Twist
                         opt_old = self.pose_graph.get_optimized_pose(best_match_id)
                         opt_new = self.pose_graph.get_optimized_pose(self.submap_count)
                         odom_rel = np.linalg.inv(opt_old) @ opt_new
                         T_relative_anchors[:3, :3] = odom_rel[:3, :3]
                         
-                        # --- [FIX 3]: INDOOR SPATIAL GUARD ---
                         odom_dist = np.linalg.norm(opt_new[:3, 3] - opt_old[:3, 3])
                         lc_dist = np.linalg.norm(T_relative_anchors[:3, 3])
                         
-                        # In a single room, odometry drift is small. Reject the edge if 
-                        # VGGT disagrees with the tracking baseline by more than 75cm.
                         if abs(odom_dist - lc_dist) < 0.75:
                             self.pose_graph.add_loop_closure(best_match_id, self.submap_count, T_relative_anchors)
                             self.loop_closures.append((best_match_id, self.submap_count))
@@ -200,15 +190,12 @@ class StreamingWindowEngineLC:
                         
                 self.pose_graph.optimize()
 
-            # --- 5. ASYNC TSDF DISPATCH ---
             optimized_anchor = self.pose_graph.get_optimized_pose(self.submap_count)
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
             
             for j in range(self.window_size):
                 global_pose = optimized_anchor @ canonical_poses[j]
                 
-                # --- THE FIX: ISOLATE RENDERING POSE FROM TRACKING POSE ---
-                # Create a copy so we don't poison the Kabsch tracking targets
                 tsdf_pose = global_pose.copy()
                 if tsdf_pose[1, 1] < 0:
                     flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
@@ -221,13 +208,11 @@ class StreamingWindowEngineLC:
                     batch_depths.append(depth_map)
                     batch_rgbs.append(window_frames[j])
                     batch_masks.append(window_masks[j])
-                    # Send the rendering pose to the TSDF
                     batch_poses.append(tsdf_pose) 
                     
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
                         self.prev_overlap_global_poses = []
-                    # Keep the PRISTINE global pose for the continuous Kabsch chain
                     self.prev_overlap_global_poses.append(global_pose)
             
             self.prev_overlap_raw_pts = pts_list[-self.overlap:]
@@ -256,4 +241,9 @@ class StreamingWindowEngineLC:
             p2 = self.pose_graph.get_optimized_pose(to_id)[:3, 3]
             lc_edges.append((p1, p2))
             
-        return self.tsdf.extract_point_cloud(surface_threshold=0.02), np.array(trajectory), lc_edges
+        # --- NEW: Extracting both Mesh and PCD ---
+        surface_thresh = 0.02
+        pcd = self.tsdf.extract_point_cloud(surface_threshold=surface_thresh)
+        mesh = self.tsdf.extract_mesh(surface_threshold=surface_thresh, poisson_depth=9)
+        
+        return mesh, pcd, np.array(trajectory), lc_edges

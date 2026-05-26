@@ -41,19 +41,46 @@ class FastStaticTSDF:
             
         C = pose[:3, 3]
         
-        min_b = torch.floor((C - self.max_depth) / self.block_size).int()
-        max_b = torch.ceil((C + self.max_depth) / self.block_size).int()
+        # --- NEW: SURFACE-GUIDED SPARSE ALLOCATION ---
+        # 1. Downsample depth map to speed up raycasting (skip every 8 pixels)
+        skip = 8
+        d_small = depth_map[::skip, ::skip]
         
-        bx = torch.arange(min_b[0], max_b[0]+1, device=self.device)
-        by = torch.arange(min_b[1], max_b[1]+1, device=self.device)
-        bz = torch.arange(min_b[2], max_b[2]+1, device=self.device)
+        # 2. Generate equirectangular rays matching your panoramic projection
+        H, W = d_small.shape
+        v_norm = torch.linspace(-1, 1, H, device=self.device)
+        u_norm = torch.linspace(-1, 1, W, device=self.device)
+        vv, uu = torch.meshgrid(v_norm, u_norm, indexing='ij')
         
-        X_grid, Y_grid, Z_grid = torch.meshgrid(bx, by, bz, indexing='ij')
-        block_coords = torch.stack([X_grid, Y_grid, Z_grid], dim=-1).view(-1, 3)
+        theta = uu * torch.pi
+        phi = vv * (torch.pi / 2.0)
         
-        centers = (block_coords + 0.5) * self.block_size
-        dists = torch.norm(centers - C, dim=-1)
-        valid_blocks = block_coords[dists <= (self.max_depth + self.block_size)]
+        X_ray = torch.cos(phi) * torch.sin(theta)
+        Y_ray = torch.sin(phi)
+        Z_ray = torch.cos(phi) * torch.cos(theta)
+        rays = torch.stack([X_ray, Y_ray, Z_ray], dim=-1) 
+        
+        # 3. Filter to valid points within mapping range
+        valid = (d_small > 0.1) & (d_small < self.max_depth)
+        valid_rays = rays[valid]
+        valid_depths = d_small[valid].unsqueeze(-1)
+        
+        cam_pts = valid_rays * valid_depths
+        
+        # 4. Transform to World Space
+        pose_R = pose[:3, :3]
+        world_pts = (cam_pts @ pose_R.T) + C
+        
+        # 5. Add margin layers (front/back) to ensure we carve space correctly
+        ray_dirs_world = valid_rays @ pose_R.T
+        pts_front = world_pts - ray_dirs_world * self.margin
+        pts_back = world_pts + ray_dirs_world * self.margin
+        
+        all_pts = torch.cat([world_pts, pts_front, pts_back], dim=0)
+        
+        # 6. Hash to unique blocks (No more allocating empty air!)
+        block_coords = torch.floor(all_pts / self.block_size).int()
+        valid_blocks = torch.unique(block_coords, dim=0)
         
         valid_blocks_cpu = valid_blocks.cpu().numpy()
         
@@ -115,28 +142,19 @@ class FastStaticTSDF:
             sampled_rgb = F.grid_sample(rgb_tensor, grid, mode='bilinear', align_corners=True).squeeze().T
             
             sdf = sampled_depth - r
-            valid = (sampled_mask > 0.5) & (sampled_depth > 0.1) & (r < self.max_depth) & (sdf > -self.margin)
+            valid_mask = (sampled_mask > 0.5) & (sampled_depth > 0.1) & (r < self.max_depth) & (sdf > -self.margin)
             
-            tsdf_update = torch.clamp(sdf[valid] / self.margin, -1.0, 1.0)
+            tsdf_update = torch.clamp(sdf[valid_mask] / self.margin, -1.0, 1.0)
             
-            # --- FIX 2: ASYMMETRIC CONFIDENCE WEIGHTING ---
-            # 1. Close observations inherently get more weight.
-            w_dist = 1.0 / (r[valid] + 0.5) 
-            
-            # 2. Carving Decay: If a ray thinks a voxel is "empty space" (sdf > margin), 
-            # make its updating power 10x weaker to protect thin objects from grazing rays.
-            w_carve = torch.where(sdf[valid] > self.margin, 0.1, 1.0).to(self.device)
-            
+            w_dist = 1.0 / (r[valid_mask] + 0.5) 
+            w_carve = torch.where(sdf[valid_mask] > self.margin, 0.1, 1.0).to(self.device)
             new_w = w_dist * w_carve
             
-            # Apply the weighted update
-            old_tsdf[valid] = (old_tsdf[valid] * old_w[valid] + tsdf_update * new_w) / (old_w[valid] + new_w)
-            old_w[valid] += new_w
+            old_tsdf[valid_mask] = (old_tsdf[valid_mask] * old_w[valid_mask] + tsdf_update * new_w) / (old_w[valid_mask] + new_w)
+            old_w[valid_mask] += new_w
             
-            # --- FIX 1: COLOR HYSTERESIS ---
-            # Must be at least 15cm closer to steal the color, preventing micro-tearing.
             closer_mask = r < (old_min_dist - 0.15)
-            color_update_mask = valid & closer_mask
+            color_update_mask = valid_mask & closer_mask
             
             if color_update_mask.any():
                 old_colors[color_update_mask] = sampled_rgb[color_update_mask]
@@ -181,3 +199,48 @@ class FastStaticTSDF:
         
         print(f"      [Profile - Extraction] GPU Vector Extraction: {len(pcd.points)} points in {time.time() - t_start:.4f} sec")
         return pcd
+
+    # --- NEW: MESH EXTRACTION ---
+    def extract_mesh(self, surface_threshold=None, poisson_depth=9):
+        t_start = time.time()
+        pcd = self.extract_point_cloud(surface_threshold)
+        
+        if len(pcd.points) < 500:
+            print("      [Profile - Extraction] Not enough points to compute a valid mesh.")
+            return o3d.geometry.TriangleMesh()
+
+        print(f"      [Profile - Extraction] Estimating Normals for {len(pcd.points)} points...")
+        # Search radius scaled slightly above voxel size to ensure smooth normal interpolation
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 4.0, max_nn=30))
+        pcd.orient_normals_consistent_tangent_plane(100)
+
+        print("      [Profile - Extraction] Running Poisson Surface Reconstruction...")
+        # Depth 9 usually yields sharp room-scale geometry without excessive memory usage
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=poisson_depth)
+
+        print("      [Profile - Extraction] Cleaning up mesh artifacts...")
+        # Poisson algorithms close holes by creating a giant bubble around the scene.
+        # We trim away any vertices with low point-cloud density to reveal the true layout.
+        densities = np.asarray(densities)
+        density_threshold = np.quantile(densities, 0.05)
+        vertices_to_remove = densities < density_threshold
+        mesh.remove_vertices_by_mask(vertices_to_remove)
+
+        # Crop strictly to the mapped bounds
+        bbox = pcd.get_axis_aligned_bounding_box()
+        mesh = mesh.crop(bbox)
+        
+        # Color interpolation based on closest points
+        kd_tree = o3d.geometry.KDTreeFlann(pcd)
+        mesh_vertices = np.asarray(mesh.vertices)
+        pcd_colors = np.asarray(pcd.colors)
+        mesh_colors = np.zeros_like(mesh_vertices)
+        
+        for i in range(len(mesh_vertices)):
+            [_, idx, _] = kd_tree.search_knn_vector_3d(mesh_vertices[i], 1)
+            mesh_colors[i] = pcd_colors[idx[0]]
+            
+        mesh.vertex_colors = o3d.utility.Vector3dVector(mesh_colors)
+
+        print(f"      [Profile - Extraction] Mesh created in {time.time() - t_start:.4f} sec")
+        return mesh

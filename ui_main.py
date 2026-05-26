@@ -37,6 +37,13 @@ def save_pcd_to_ply(pcd, prefix="reconstruction"):
     return ply_path
 
 
+def save_mesh_to_glb(mesh, prefix="reconstruction"):
+    temp_dir = tempfile.mkdtemp()
+    glb_path = os.path.join(temp_dir, f"{prefix}.glb")
+    o3d.io.write_triangle_mesh(glb_path, mesh)
+    return glb_path
+
+
 def create_plotly_figure_from_pcd(pcd, max_points=150000):
     points = np.asarray(pcd.points)
     colors = np.asarray(pcd.colors) * 255
@@ -231,13 +238,17 @@ def process_sequence_ui(
     streaming_engine.window_size = int(window_size)
     streaming_engine.overlap = int(overlap)
 
-    # Unpack the graph trajectory and loop closure edges
-    global_pcd, trajectory, lc_edges = streaming_engine.process_sequence(frames, masks)
+    # NEW UNPACKING: Catching the generated mesh
+    mesh, global_pcd, trajectory, lc_edges = streaming_engine.process_sequence(frames, masks)
     
-    # Render using the new visualizer
+    # Render using the existing visualizer for point clouds
     fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, lc_edges)
     
-    return fig, save_pcd_to_ply(global_pcd, "global_stitched_map")
+    # Save both exports to disk so Gradio can host them for download and display
+    pcd_path = save_pcd_to_ply(global_pcd, "global_stitched_map")
+    mesh_path = save_mesh_to_glb(mesh, "global_stitched_mesh")
+    
+    return fig, pcd_path, mesh_path, mesh_path
 
 
 def toggle_input_mode(mode):
@@ -319,8 +330,14 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
                     )
 
                     run_seq_btn = gr.Button("Align & Stitch Sequence", variant="primary")
-                    output_3d_seq = gr.Plot(label="Global Stitched Map")
-                    download_seq = gr.File(label="💾 Download Global .ply")
+                    
+                    with gr.Tabs():
+                        with gr.Tab("Point Cloud Viewer"):
+                            output_3d_seq = gr.Plot(label="Global Stitched Map")
+                            download_seq = gr.File(label="💾 Download Global .ply")
+                        with gr.Tab("High-Res Mesh"):
+                            output_mesh = gr.Model3D(label="High-Res Poisson Mesh")
+                            download_mesh = gr.File(label="💾 Download Global .glb")
 
     # --- Wire-ups ---
     target_width.release(
@@ -372,7 +389,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
             target_width, target_height,
             window_size_slider, overlap_slider,
         ],
-        outputs=[output_3d_seq, download_seq],
+        outputs=[output_3d_seq, download_seq, output_mesh, download_mesh],
         api_name=False,
     )
 
