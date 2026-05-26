@@ -8,7 +8,7 @@ from .inference_utils import align_cam_pts_irls
 from .utils.geometry import register_camera_poses_kabsch
 from .tsdf_volume import FastStaticTSDF  
 from .pano_graph import PanoPoseGraph  
-from .loop_closure import ImageRetrieval  
+from .loop_closure import ImageRetrieval
 
 class StreamingWindowEngineLC:
     def __init__(self, vanilla_engine, window_size=16, overlap=2, device="cuda"):
@@ -17,7 +17,6 @@ class StreamingWindowEngineLC:
         self.overlap = overlap
         self.device = device
         
-        # Async TSDF Worker
         self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
         self.tsdf_future = None
         
@@ -39,18 +38,32 @@ class StreamingWindowEngineLC:
         self.submap_count = 0
         self.is_first_window = True
         self.current_metric_scale = 1.0
+        self.last_integrated_pose = None
         
         # Loop closure memory banks
         self.lc_embeddings = {}
         self.lc_anchor_frames = {}
-        self.loop_closures = []  # Tracks detected loop connections for visualization
+        self.loop_closures = []
+
+    def _is_keyframe(self, current_pose, trans_thresh=0.15, rot_thresh=5.0):
+        if self.last_integrated_pose is None:
+            return True
+        dt = np.linalg.norm(current_pose[:3, 3] - self.last_integrated_pose[:3, 3])
+        R_diff = self.last_integrated_pose[:3, :3].T @ current_pose[:3, :3]
+        trace = np.clip(np.trace(R_diff), -1.0, 3.0)
+        angle = np.degrees(np.arccos((trace - 1.0) / 2.0))
+        return dt > trans_thresh or angle > rot_thresh
 
     def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
         t_start = time.time()
+        integrated = 0
         for j in range(len(poses)):
-            self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
+            if self._is_keyframe(poses[j]):
+                self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
+                self.last_integrated_pose = poses[j]
+                integrated += 1
         torch.cuda.synchronize()
-        return len(poses), time.time() - t_start
+        return integrated, time.time() - t_start
 
     def process_sequence(self, frames, masks):
         self.reset()
@@ -64,7 +77,7 @@ class StreamingWindowEngineLC:
             
             print(f"\n[Engine] Processing Submap {self.submap_count}...")
             
-            # 1. VGGT Inference
+            # --- 1. VGGT INFERENCE ---
             t_gpu = time.time()
             preds = self.engine(window_frames)
             torch.cuda.synchronize()  
@@ -73,7 +86,7 @@ class StreamingWindowEngineLC:
             pts_list = preds["points"] 
             poses = preds["poses"]
             
-            # 2. SALAD Embeddings
+            # --- 2. SALAD LOOP CLOSURE EMBEDDING ---
             mid_idx = self.window_size // 2
             mid_frame = window_frames[mid_idx]
             current_emb = self.retriever.get_single_embeding(mid_frame)
@@ -81,7 +94,7 @@ class StreamingWindowEngineLC:
             self.lc_embeddings[self.submap_count] = current_emb
             self.lc_anchor_frames[self.submap_count] = mid_frame
             
-            # 3. Metric Alignment (LASER IRLS)
+            # --- 3. METRIC SCALE ALIGNMENT ---
             if self.is_first_window:
                 first_depth = np.linalg.norm(pts_list[0], axis=-1)
                 valid_depths = first_depth[first_depth > 0.1]
@@ -99,6 +112,7 @@ class StreamingWindowEngineLC:
                 clipped_scale = np.clip(raw_scale_diff, 0.95, 1.05)
                 self.current_metric_scale *= (0.8 * 1.0 + 0.2 * clipped_scale)
 
+            # Convert to Canonical Local Space
             metric_local_poses = []
             for p in poses:
                 mp = p.copy()
@@ -108,10 +122,11 @@ class StreamingWindowEngineLC:
             submap_origin_inv = np.linalg.inv(metric_local_poses[0])
             canonical_poses = [submap_origin_inv @ mp for mp in metric_local_poses]
 
-            # 4. Graph Architecture
+            # --- 4. GTSAM GRAPH CONSTRUCTION ---
             if self.is_first_window:
                 self.pose_graph.add_prior(self.submap_count, np.eye(4))
             else:
+                # Odometry Edge
                 src_cam_np = np.stack(canonical_poses[:self.overlap])
                 tgt_cam_np = np.stack(self.prev_overlap_global_poses)
                 R_align, t_align = register_camera_poses_kabsch(src_cam_np, tgt_cam_np, scale=1.0)
@@ -125,7 +140,7 @@ class StreamingWindowEngineLC:
                 
                 self.pose_graph.add_odometry(self.submap_count - 1, self.submap_count, T_rel, anchor_guess)
                 
-                # Check Closures
+                # Loop Closure Search
                 best_score = -1.0
                 best_match_id = -1
                 for old_id, old_emb in self.lc_embeddings.items():
@@ -139,6 +154,7 @@ class StreamingWindowEngineLC:
                     print(f"  [SLAM] 🟢 LOOP CLOSURE: Submap {self.submap_count} -> {best_match_id} (Score: {best_score:.3f})")
                     old_frame = self.lc_anchor_frames[best_match_id]
                     
+                    # Extract relative geometry directly from VGGT
                     lc_preds = self.engine(np.stack([old_frame, mid_frame]))
                     T_lc_raw = lc_preds["poses"][1] 
                     T_lc_metric = T_lc_raw.copy()
@@ -149,7 +165,7 @@ class StreamingWindowEngineLC:
                 
                 self.pose_graph.optimize()
 
-            # 5. Volumetric Packing
+            # --- 5. ASYNC TSDF DISPATCH ---
             optimized_anchor = self.pose_graph.get_optimized_pose(self.submap_count)
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
             
@@ -189,17 +205,16 @@ class StreamingWindowEngineLC:
 
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
         
-        # Gather optimized trajectory coordinates (XYZ translations)
+        # --- 6. EXTRACT TRAJECTORY & LOOP CLOSURES ---
         trajectory = []
         for i in range(self.submap_count):
             pose = self.pose_graph.get_optimized_pose(i)
-            trajectory.append(pose[:3, 3])
+            trajectory.append(pose[:3, 3]) 
             
-        # Gather physical connection line vectors for loop closures
         lc_edges = []
         for (from_id, to_id) in self.loop_closures:
             p1 = self.pose_graph.get_optimized_pose(from_id)[:3, 3]
             p2 = self.pose_graph.get_optimized_pose(to_id)[:3, 3]
             lc_edges.append((p1, p2))
-
+            
         return self.tsdf.extract_point_cloud(surface_threshold=0.02), np.array(trajectory), lc_edges

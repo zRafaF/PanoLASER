@@ -9,9 +9,7 @@ class PanoPoseGraph:
         self.optimized_values = gtsam.Values()
         
         # Noise models
-        # High confidence for odometry (small noise)
         self.odom_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([0.05, 0.05, 0.05, 0.1, 0.1, 0.1]))
-        # Absolute lock on the first frame
         self.prior_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-6] * 6))
         
         self.nodes = set()
@@ -39,12 +37,19 @@ class PanoPoseGraph:
             self.initial_estimates.insert(to_id, est_pose3)
             self.nodes.add(to_id)
 
+    def add_loop_closure(self, from_id: int, to_id: int, relative_mat: np.ndarray, noise_multiplier: float = 2.0):
+        """Adds a loop closure constraint with relaxed noise to let the graph flex."""
+        rel_pose3 = self._matrix_to_pose3(relative_mat)
+        lc_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([0.05, 0.05, 0.05, 0.1, 0.1, 0.1]) * noise_multiplier
+        )
+        self.graph.add(gtsam.BetweenFactorPose3(from_id, to_id, rel_pose3, lc_noise))
+
     def optimize(self):
         """Runs Levenberg-Marquardt optimization."""
         params = gtsam.LevenbergMarquardtParams()
         optimizer = gtsam.LevenbergMarquardtOptimizer(self.graph, self.initial_estimates, params)
         self.optimized_values = optimizer.optimize()
-        # Update our initial estimates to the newly optimized ones for the next step
         self.initial_estimates = self.optimized_values
 
     def get_optimized_pose(self, node_id: int) -> np.ndarray:
@@ -52,15 +57,3 @@ class PanoPoseGraph:
         if self.optimized_values.exists(node_id):
             return self.optimized_values.atPose3(node_id).matrix()
         return self.initial_estimates.atPose3(node_id).matrix()
-    
-    def add_loop_closure(self, from_id: int, to_id: int, relative_mat: np.ndarray, noise_multiplier: float = 2.0):
-        """Adds a loop closure constraint. Noise is slightly relaxed to let the graph flex and settle."""
-        rel_pose3 = self._matrix_to_pose3(relative_mat)
-        
-        # Loop closures inherently have more uncertainty than sequential odometry, 
-        # so we relax the noise model slightly so the graph doesn't mathematically snap/break.
-        lc_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.05, 0.05, 0.05, 0.1, 0.1, 0.1]) * noise_multiplier
-        )
-        
-        self.graph.add(gtsam.BetweenFactorPose3(from_id, to_id, rel_pose3, lc_noise))
