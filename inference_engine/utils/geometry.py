@@ -32,19 +32,32 @@ def homogenize_points_np(points):
     return np.concatenate([points, np.ones_like(points[..., :1])], axis=-1)
 
 def register_camera_poses_kabsch(src_cam_poses: np.ndarray, tgt_cam_poses: np.ndarray, scale=1.0):
+    """
+    Aligns two sets of camera poses using Kabsch algorithm.
+    Enhanced with full 3D coordinate frame locking to prevent collinear degeneracy.
+    """
     assert src_cam_poses.shape == tgt_cam_poses.shape
     
-    src_cam_pos = src_cam_poses[:, :3, 3]
-    src_cam_view = src_cam_poses[:, :3, :3] @ np.array([0., 0., -1.])
-    src_cam_view_norm = src_cam_view / np.linalg.norm(src_cam_view, axis=-1, keepdims=True)
+    # 1. Extract and scale translation
+    src_pos = src_cam_poses[:, :3, 3] * scale
+    tgt_pos = tgt_cam_poses[:, :3, 3]
 
-    tgt_cam_pos = tgt_cam_poses[:, :3, 3]
-    tgt_cam_view = tgt_cam_poses[:, :3, :3] @ np.array([0., 0., -1.])
-    tgt_cam_view_norm = tgt_cam_view / np.linalg.norm(tgt_cam_view, axis=-1, keepdims=True)
+    # 2. Extract full coordinate frame (X, Y, Z axes) for orientation locking
+    # This prevents the submap from spinning if the camera trajectory is a straight line.
+    src_x = src_cam_poses[:, :3, :3] @ np.array([1., 0., 0.])
+    src_y = src_cam_poses[:, :3, :3] @ np.array([0., 1., 0.])
+    src_z = src_cam_poses[:, :3, :3] @ np.array([0., 0., 1.])
 
-    src_pts = np.concatenate([src_cam_pos, src_cam_pos + src_cam_view_norm], axis=0) * scale
-    tgt_pts = np.concatenate([tgt_cam_pos, tgt_cam_pos + tgt_cam_view_norm], axis=0)
+    tgt_x = tgt_cam_poses[:, :3, :3] @ np.array([1., 0., 0.])
+    tgt_y = tgt_cam_poses[:, :3, :3] @ np.array([0., 1., 0.])
+    tgt_z = tgt_cam_poses[:, :3, :3] @ np.array([0., 0., 1.])
 
+    # 3. Build Point Clouds (Position + Triad)
+    # We append unit vectors to the scaled positions.
+    src_pts = np.concatenate([src_pos, src_pos + src_x, src_pos + src_y, src_pos + src_z], axis=0)
+    tgt_pts = np.concatenate([tgt_pos, tgt_pos + tgt_x, tgt_pos + tgt_y, tgt_pos + tgt_z], axis=0)
+
+    # 4. Standard Kabsch SVD
     src_centroid = np.mean(src_pts, axis=0)
     tgt_centroid = np.mean(tgt_pts, axis=0)
 
@@ -57,12 +70,12 @@ def register_camera_poses_kabsch(src_cam_poses: np.ndarray, tgt_cam_poses: np.nd
 
     # Fix improper rotation (reflection)
     if np.linalg.det(R) < 0:
-        Vt[2, :] *= -1
+        Vt[-1, :] *= -1
         R = Vt.T @ U.T
 
     t = tgt_centroid - R @ src_centroid
+    
     return R, t
-
 def apply_scale_with_so3(poses, R, scale):
     """Apply scale to camera poses in a rotated basis."""
     device = poses.device
