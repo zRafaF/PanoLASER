@@ -4,12 +4,6 @@ import numpy as np
 from PIL import Image
 import torchvision.transforms as T
 
-# Load the SALAD model from your local environment setup
-try:
-    from salad.eval import load_model
-except ImportError:
-    print("WARNING: Could not import salad.eval. Please ensure SALAD is installed in your venv.")
-
 class ImageRetrieval:
     def __init__(self, input_size=224, device=None):
         """
@@ -18,8 +12,17 @@ class ImageRetrieval:
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[SALAD] Loading Loop Closure Model on {self.device}...")
         
-        # 1. Load Model
-        self.model = load_model()
+        # 1. Load Model via PyTorch Hub (Bypasses the need for pip install!)
+        try:
+            print("[SALAD] Fetching architecture and weights from Torch Hub...")
+            self.model = torch.hub.load('serizba/salad', 'dinov2_salad', trust_repo=True)
+        except Exception as e:
+            print(f"[SALAD] Torch Hub load failed: {e}")
+            print("[SALAD] Falling back to local import...")
+            # Fallback if you eventually set up the local module
+            from salad.eval import load_model 
+            self.model = load_model()
+
         self.model.to(self.device)
         self.model.eval()
         
