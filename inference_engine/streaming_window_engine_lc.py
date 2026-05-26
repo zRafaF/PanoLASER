@@ -161,22 +161,33 @@ class StreamingWindowEngineLC:
                         T_lc_metric = T_lc_raw.copy()
                         T_lc_metric[:3, 3] *= lc_scale
                         
-                        # --- [FIX 1]: UPRIGHTNESS CONSTRAINT ---
+                        # --- [FIX 1]: PROPER UPRIGHTNESS CONSTRAINT ---
+                        # Apply a 4x4 matrix sandwich to correctly flip BOTH the 
+                        # rotation axes and the translation vector components.
                         if T_lc_metric[1, 1] < 0:
-                            flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-                            T_lc_metric[:3, :3] = T_lc_metric[:3, :3] @ flip_R
+                            flip_4x4 = np.eye(4)
+                            flip_4x4[1, 1] = -1
+                            flip_4x4[2, 2] = -1
+                            T_lc_metric = flip_4x4 @ T_lc_metric @ flip_4x4
                             
                         C_old = self.lc_mid_canonical_poses[best_match_id]
                         C_new = self.lc_mid_canonical_poses[self.submap_count]
                         T_relative_anchors = C_old @ T_lc_metric @ np.linalg.inv(C_new)
                         
-                        # --- [FIX 2]: SPATIAL HALLUCINATION GUARD ---
+                        # --- [FIX 2]: NEUTRALIZE ROTATIONAL TWIST ---
+                        # Odometry rotation is highly accurate; VGGT 2-frame rotation is noisy.
+                        # Override the LC rotation constraint to perfectly match odometry. 
+                        # This forces GTSAM to ONLY use this edge for XYZ translation correction.
                         opt_old = self.pose_graph.get_optimized_pose(best_match_id)
                         opt_new = self.pose_graph.get_optimized_pose(self.submap_count)
+                        odom_rel = np.linalg.inv(opt_old) @ opt_new
+                        T_relative_anchors[:3, :3] = odom_rel[:3, :3]
+                        
+                        # --- [FIX 3]: SPATIAL HALLUCINATION GUARD ---
                         odom_dist = np.linalg.norm(opt_new[:3, 3] - opt_old[:3, 3])
                         lc_dist = np.linalg.norm(T_relative_anchors[:3, 3])
                         
-                        # Reject the loop closure if VGGT hallucinated a distance > 10 meters off from the Odometry tracking
+                        # Reject the loop closure if VGGT hallucinated a distance > 10 meters off
                         if abs(odom_dist - lc_dist) < 10.0:
                             self.pose_graph.add_loop_closure(best_match_id, self.submap_count, T_relative_anchors)
                             self.loop_closures.append((best_match_id, self.submap_count))
