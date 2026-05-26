@@ -64,6 +64,11 @@ mkdir -p checkpoints
 wget https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt -O checkpoints/model.pt
 ```
 
+Optional: Install loop closure weights for the streaming window engine:
+```bash
+sh ./scripts/download_weights.sh
+```
+
 ## 🚀 Usage
 
 Whenever you execute scripts or run tests in this repository, prepend your command with `uv run` to automatically trigger execution inside the locked dependencies network without manually activating anything:
