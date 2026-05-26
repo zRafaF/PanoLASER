@@ -161,7 +161,6 @@ class FastStaticTSDF:
             self.min_dist[idx_tensor] = old_min_dist.view(B, N)
 
     def extract_point_cloud(self, surface_threshold=None, max_points=250000):
-        """Extracts the point cloud, aggressively downsampling on the GPU to maintain <1s stream speeds."""
         t_start = time.time()
         
         if self.next_idx == 0:
@@ -181,15 +180,19 @@ class FastStaticTSDF:
         if len(b_idx) == 0:
             return o3d.geometry.PointCloud()
             
-        # --- GPU OPTIMIZATION: PyTorch Decimation ---
-        # Never send 17 million points to the CPU. Subsample directly on the GPU.
         total_points = len(b_idx)
         if total_points > max_points:
-            perm = torch.randperm(total_points, device=self.device)[:max_points]
-            b_idx = b_idx[perm]
-            v_idx = v_idx[perm]
+            # --- FIX 1: CONFIDENCE-BASED DECIMATION ---
+            # Grab the raw confidence weights of valid surface points
+            point_weights = weights[b_idx, v_idx]
             
-        # Use our pre-allocated tensor instead of recreating it from the python dict
+            # Isolate the indices of the highest-confidence points on the GPU
+            _, top_k_indices = torch.topk(point_weights, max_points)
+            
+            # Filter our coordinates to only keep the top tier data
+            b_idx = b_idx[top_k_indices]
+            v_idx = v_idx[top_k_indices]
+            
         valid_block_coords = self.block_coords_tensor[b_idx]
         valid_local_coords = self.block_template[v_idx]
         
@@ -200,47 +203,79 @@ class FastStaticTSDF:
         pcd.points = o3d.utility.Vector3dVector(coords.cpu().numpy())
         pcd.colors = o3d.utility.Vector3dVector(colors.cpu().numpy())
         
-        print(f"      [Profile - Extraction] GPU Decimated Extraction: {len(pcd.points)} points in {time.time() - t_start:.4f} sec")
+        print(f"      [Profile - Extraction] GPU Confidence Extraction: {len(pcd.points)} points in {time.time() - t_start:.4f} sec")
         return pcd
 
-    def extract_mesh(self, surface_threshold=None, poisson_depth=8):
-        """Only called at the very end. Heavy CPU operation."""
+    def extract_mesh(self, surface_threshold=None, poisson_depth=None):
+        """Replaces slow CPU Poisson with highly optimized Cython Marching Cubes."""
         t_start = time.time()
+        import skimage.measure
+        from scipy.spatial import cKDTree
         
-        # Extract a reasonably sized point cloud for meshing
-        pcd = self.extract_point_cloud(surface_threshold, max_points=1000000)
-        
-        if len(pcd.points) < 500:
+        if self.next_idx == 0:
             return o3d.geometry.TriangleMesh()
-
-        # Voxel downsample heavily smooths the surface for cleaner normals
-        pcd = pcd.voxel_down_sample(voxel_size=self.voxel_size * 2.5)
-
-        print(f"      [Profile - Extraction] Estimating Normals for {len(pcd.points)} points...")
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 4.0, max_nn=30))
-        pcd.orient_normals_consistent_tangent_plane(100)
-
-        print("      [Profile - Extraction] Running Poisson Surface Reconstruction...")
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=poisson_depth)
-
-        densities = np.asarray(densities)
-        density_threshold = np.quantile(densities, 0.05)
-        vertices_to_remove = densities < density_threshold
-        mesh.remove_vertices_by_mask(vertices_to_remove)
-
-        bbox = pcd.get_axis_aligned_bounding_box()
-        mesh = mesh.crop(bbox)
-        
-        kd_tree = o3d.geometry.KDTreeFlann(pcd)
-        mesh_vertices = np.asarray(mesh.vertices)
-        pcd_colors = np.asarray(pcd.colors)
-        mesh_colors = np.zeros_like(mesh_vertices)
-        
-        for i in range(len(mesh_vertices)):
-            [_, idx, _] = kd_tree.search_knn_vector_3d(mesh_vertices[i], 1)
-            mesh_colors[i] = pcd_colors[idx[0]]
             
-        mesh.vertex_colors = o3d.utility.Vector3dVector(mesh_colors)
-
-        print(f"      [Profile - Extraction] Mesh created in {time.time() - t_start:.4f} sec")
+        print("      [Profile - Extraction] Assembling GPU volume for Marching Cubes...")
+        # 1. Calculate the active bounding box of the scene
+        active_blocks = self.block_coords_tensor[:self.next_idx]
+        min_b = active_blocks.min(dim=0)[0]
+        max_b = active_blocks.max(dim=0)[0]
+        
+        grid_dim_blocks = (max_b - min_b) + 1
+        grid_shape = (grid_dim_blocks * self.block_res).cpu().numpy()
+        
+        # 2. Reconstruct dense TSDF locally on the GPU
+        dense_tsdf = torch.ones(tuple(grid_shape), dtype=torch.float32, device=self.device)
+        
+        rel_blocks = active_blocks - min_b
+        voxel_coords_global = (rel_blocks.unsqueeze(1) * self.block_res)
+        
+        x = torch.arange(self.block_res, device=self.device)
+        grid_x, grid_y, grid_z = torch.meshgrid(x, x, x, indexing='ij')
+        local_coords = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3)
+        
+        all_indices = (voxel_coords_global + local_coords.unsqueeze(0)).view(-1, 3)
+        
+        # Filter out uninitialized empty air blocks to speed up tensor assignment
+        B = self.next_idx
+        weight_vals = self.weights[:B].view(-1)
+        valid_mask = weight_vals > 0
+        
+        valid_indices = all_indices[valid_mask]
+        valid_tsdf = self.tsdf[:B].view(-1)[valid_mask]
+        
+        # Scatter valid TSDF values into the dense spatial grid
+        dense_tsdf[valid_indices[:, 0], valid_indices[:, 1], valid_indices[:, 2]] = valid_tsdf
+        
+        # Move to CPU for the Cythonized backend
+        tsdf_vol = dense_tsdf.cpu().numpy()
+        
+        print("      [Profile - Extraction] Running Cython Marching Cubes...")
+        # Operates directly on the TSDF zero-crossings (No normal estimation required)
+        try:
+            verts, faces, normals, values = skimage.measure.marching_cubes(tsdf_vol, level=0.0)
+        except ValueError:
+            return o3d.geometry.TriangleMesh() # Failsafe if volume has no geometry
+            
+        # Convert local array matrix coordinates back to global 3D world space
+        min_b_world = min_b.cpu().numpy() * self.block_size
+        verts_world = verts * self.voxel_size + min_b_world
+        
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts_world)
+        mesh.triangles = o3d.utility.Vector3iVector(faces)
+        
+        print("      [Profile - Extraction] Colorizing Mesh via Vectorized cKDTree...")
+        # Fetch a high-res point cloud to use as a paint palette
+        pcd = self.extract_point_cloud(surface_threshold=self.voxel_size * 2, max_points=1500000)
+        pcd_verts = np.asarray(pcd.points)
+        pcd_colors = np.asarray(pcd.colors)
+        
+        # Vectorized KDTree search assigns colors to 500k vertices in milliseconds
+        if len(pcd_verts) > 0:
+            tree = cKDTree(pcd_verts)
+            _, idx = tree.query(verts_world, k=1)
+            mesh.vertex_colors = o3d.utility.Vector3dVector(pcd_colors[idx])
+        
+        print(f"      [Profile - Extraction] Final Mesh extracted in {time.time() - t_start:.4f} sec")
         return mesh
