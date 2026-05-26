@@ -22,7 +22,6 @@ class StreamingWindowEngineLC:
         
         print("[Engine] Initializing SALAD Loop Closure...")
         self.retriever = ImageRetrieval(input_size=224, device=self.device)
-        
         self.reset()
         
     def reset(self):
@@ -40,10 +39,9 @@ class StreamingWindowEngineLC:
         self.current_metric_scale = 1.0
         self.last_integrated_pose = None
         
-        # Loop closure memory banks
         self.lc_embeddings = {}
         self.lc_anchor_frames = {}
-        self.lc_mid_canonical_poses = {} # <-- FIX 1: Tracks the middle frame offset
+        self.lc_mid_canonical_poses = {} 
         self.loop_closures = []
 
     def _is_keyframe(self, current_pose, trans_thresh=0.15, rot_thresh=5.0):
@@ -78,7 +76,6 @@ class StreamingWindowEngineLC:
             
             print(f"\n[Engine] Processing Submap {self.submap_count}...")
             
-            # --- 1. VGGT INFERENCE ---
             t_gpu = time.time()
             preds = self.engine(window_frames)
             torch.cuda.synchronize()  
@@ -87,7 +84,6 @@ class StreamingWindowEngineLC:
             pts_list = preds["points"] 
             poses = preds["poses"]
             
-            # --- 2. SALAD LOOP CLOSURE EMBEDDING ---
             mid_idx = self.window_size // 2
             mid_frame = window_frames[mid_idx]
             current_emb = self.retriever.get_single_embeding(mid_frame)
@@ -95,7 +91,6 @@ class StreamingWindowEngineLC:
             self.lc_embeddings[self.submap_count] = current_emb
             self.lc_anchor_frames[self.submap_count] = mid_frame
             
-            # --- 3. METRIC SCALE ALIGNMENT ---
             if self.is_first_window:
                 first_depth = np.linalg.norm(pts_list[0], axis=-1)
                 valid_depths = first_depth[first_depth > 0.1]
@@ -113,7 +108,6 @@ class StreamingWindowEngineLC:
                 clipped_scale = np.clip(raw_scale_diff, 0.95, 1.05)
                 self.current_metric_scale *= (0.8 * 1.0 + 0.2 * clipped_scale)
 
-            # Convert to Canonical Local Space
             metric_local_poses = []
             for p in poses:
                 mp = p.copy()
@@ -122,15 +116,11 @@ class StreamingWindowEngineLC:
                 
             submap_origin_inv = np.linalg.inv(metric_local_poses[0])
             canonical_poses = [submap_origin_inv @ mp for mp in metric_local_poses]
-            
-            # Store the canonical offset of the middle frame for Loop Closure math later
             self.lc_mid_canonical_poses[self.submap_count] = canonical_poses[mid_idx]
 
-            # --- 4. GTSAM GRAPH CONSTRUCTION ---
             if self.is_first_window:
                 self.pose_graph.add_prior(self.submap_count, np.eye(4))
             else:
-                # Odometry Edge
                 src_cam_np = np.stack(canonical_poses[:self.overlap])
                 tgt_cam_np = np.stack(self.prev_overlap_global_poses)
                 R_align, t_align = register_camera_poses_kabsch(src_cam_np, tgt_cam_np, scale=1.0)
@@ -144,7 +134,6 @@ class StreamingWindowEngineLC:
                 
                 self.pose_graph.add_odometry(self.submap_count - 1, self.submap_count, T_rel, anchor_guess)
                 
-                # Loop Closure Search
                 best_score = -1.0
                 best_match_id = -1
                 for old_id, old_emb in self.lc_embeddings.items():
@@ -158,11 +147,9 @@ class StreamingWindowEngineLC:
                     print(f"  [SLAM] 🟢 LOOP DETECTED: Submap {self.submap_count} -> {best_match_id} (Score: {best_score:.3f})")
                     old_frame = self.lc_anchor_frames[best_match_id]
                     
-                    # Run VGGT on the isolated pair
                     lc_preds = self.engine(np.stack([old_frame, mid_frame]))
                     T_lc_raw = lc_preds["poses"][1] 
                     
-                    # --- FIX 2: Dynamic Metric Scaling for Loop Closure ---
                     metric_current_pts = pts_list[mid_idx] * self.current_metric_scale
                     lc_scale = align_cam_pts_irls(
                         torch.from_numpy(lc_preds["points"][1].copy()), 
@@ -170,22 +157,34 @@ class StreamingWindowEngineLC:
                         torch.from_numpy(window_masks[mid_idx].copy())
                     )
                     
-                    # Sanity Guard: If VGGT struggled with the panoramic rotation, the scale will explode/collapse.
                     if 0.1 < lc_scale < 10.0:
                         T_lc_metric = T_lc_raw.copy()
                         T_lc_metric[:3, 3] *= lc_scale
                         
-                        # --- FIX 1: Anchor Node Math ---
+                        # --- [FIX 1]: UPRIGHTNESS CONSTRAINT ---
+                        if T_lc_metric[1, 1] < 0:
+                            flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+                            T_lc_metric[:3, :3] = T_lc_metric[:3, :3] @ flip_R
+                            
                         C_old = self.lc_mid_canonical_poses[best_match_id]
                         C_new = self.lc_mid_canonical_poses[self.submap_count]
-                        
                         T_relative_anchors = C_old @ T_lc_metric @ np.linalg.inv(C_new)
                         
-                        self.pose_graph.add_loop_closure(best_match_id, self.submap_count, T_relative_anchors)
-                        self.loop_closures.append((best_match_id, self.submap_count))
-                        print(f"  [SLAM] ✅ LOOP APPLIED (Scale aligned: {lc_scale:.2f})")
+                        # --- [FIX 2]: SPATIAL HALLUCINATION GUARD ---
+                        opt_old = self.pose_graph.get_optimized_pose(best_match_id)
+                        opt_new = self.pose_graph.get_optimized_pose(self.submap_count)
+                        odom_dist = np.linalg.norm(opt_new[:3, 3] - opt_old[:3, 3])
+                        lc_dist = np.linalg.norm(T_relative_anchors[:3, 3])
+                        
+                        # Reject the loop closure if VGGT hallucinated a distance > 10 meters off from the Odometry tracking
+                        if abs(odom_dist - lc_dist) < 10.0:
+                            self.pose_graph.add_loop_closure(best_match_id, self.submap_count, T_relative_anchors)
+                            self.loop_closures.append((best_match_id, self.submap_count))
+                            print(f"  [SLAM] ✅ LOOP APPLIED (Scale: {lc_scale:.2f}, Drift Corrected: {abs(odom_dist - lc_dist):.2f}m)")
+                        else:
+                            print(f"  [SLAM] 🟡 LOOP REJECTED (Spatial Hallucination: {lc_dist:.2f}m vs Odom {odom_dist:.2f}m)")
                     else:
-                        print(f"  [SLAM] 🟡 LOOP REJECTED (Neural Hallucination: Bad Scale {lc_scale:.2f})")
+                        print(f"  [SLAM] 🟡 LOOP REJECTED (Scale Hallucination: {lc_scale:.2f})")
                 
                 self.pose_graph.optimize()
 
@@ -229,7 +228,6 @@ class StreamingWindowEngineLC:
 
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
         
-        # --- 6. EXTRACT TRAJECTORY & LOOP CLOSURES ---
         trajectory = []
         for i in range(self.submap_count):
             pose = self.pose_graph.get_optimized_pose(i)
