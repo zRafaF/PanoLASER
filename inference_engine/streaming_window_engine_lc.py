@@ -143,7 +143,10 @@ class StreamingWindowEngineLC:
                             best_score = score
                             best_match_id = old_id
                 
-                if best_score > 0.85: 
+                # --- [FIX 1]: STRICTER VISUAL THRESHOLD FOR 360 IMAGES ---
+                # 360 images of the same room look very similar. Bump to 0.92 to ensure 
+                # we are actually standing in the exact same spot, not just the same room.
+                if best_score > 0.92: 
                     print(f"  [SLAM] 🟢 LOOP DETECTED: Submap {self.submap_count} -> {best_match_id} (Score: {best_score:.3f})")
                     old_frame = self.lc_anchor_frames[best_match_id]
                     
@@ -157,13 +160,13 @@ class StreamingWindowEngineLC:
                         torch.from_numpy(window_masks[mid_idx].copy())
                     )
                     
-                    if 0.1 < lc_scale < 10.0:
+                    # --- [FIX 2]: CLAMP SCALE HALLUCINATIONS ---
+                    # Reject if IRLS suggests the depth maps are scaled wildly (> 2.5x)
+                    if 0.5 < lc_scale < 2.5:
                         T_lc_metric = T_lc_raw.copy()
                         T_lc_metric[:3, 3] *= lc_scale
                         
-                        # --- [FIX 1]: PROPER UPRIGHTNESS CONSTRAINT ---
-                        # Apply a 4x4 matrix sandwich to correctly flip BOTH the 
-                        # rotation axes and the translation vector components.
+                        # Apply 4x4 matrix sandwich to correctly flip
                         if T_lc_metric[1, 1] < 0:
                             flip_4x4 = np.eye(4)
                             flip_4x4[1, 1] = -1
@@ -174,21 +177,19 @@ class StreamingWindowEngineLC:
                         C_new = self.lc_mid_canonical_poses[self.submap_count]
                         T_relative_anchors = C_old @ T_lc_metric @ np.linalg.inv(C_new)
                         
-                        # --- [FIX 2]: NEUTRALIZE ROTATIONAL TWIST ---
-                        # Odometry rotation is highly accurate; VGGT 2-frame rotation is noisy.
-                        # Override the LC rotation constraint to perfectly match odometry. 
-                        # This forces GTSAM to ONLY use this edge for XYZ translation correction.
+                        # Neutralize Rotational Twist
                         opt_old = self.pose_graph.get_optimized_pose(best_match_id)
                         opt_new = self.pose_graph.get_optimized_pose(self.submap_count)
                         odom_rel = np.linalg.inv(opt_old) @ opt_new
                         T_relative_anchors[:3, :3] = odom_rel[:3, :3]
                         
-                        # --- [FIX 3]: SPATIAL HALLUCINATION GUARD ---
+                        # --- [FIX 3]: INDOOR SPATIAL GUARD ---
                         odom_dist = np.linalg.norm(opt_new[:3, 3] - opt_old[:3, 3])
                         lc_dist = np.linalg.norm(T_relative_anchors[:3, 3])
                         
-                        # Reject the loop closure if VGGT hallucinated a distance > 10 meters off
-                        if abs(odom_dist - lc_dist) < 10.0:
+                        # In a single room, odometry drift is small. Reject the edge if 
+                        # VGGT disagrees with the tracking baseline by more than 75cm.
+                        if abs(odom_dist - lc_dist) < 0.75:
                             self.pose_graph.add_loop_closure(best_match_id, self.submap_count, T_relative_anchors)
                             self.loop_closures.append((best_match_id, self.submap_count))
                             print(f"  [SLAM] ✅ LOOP APPLIED (Scale: {lc_scale:.2f}, Drift Corrected: {abs(odom_dist - lc_dist):.2f}m)")
@@ -196,7 +197,7 @@ class StreamingWindowEngineLC:
                             print(f"  [SLAM] 🟡 LOOP REJECTED (Spatial Hallucination: {lc_dist:.2f}m vs Odom {odom_dist:.2f}m)")
                     else:
                         print(f"  [SLAM] 🟡 LOOP REJECTED (Scale Hallucination: {lc_scale:.2f})")
-                
+                        
                 self.pose_graph.optimize()
 
             # --- 5. ASYNC TSDF DISPATCH ---
