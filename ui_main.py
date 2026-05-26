@@ -8,7 +8,7 @@ from PIL import Image
 
 from pano_wrapper import PanoVGGTExtractor
 from inference_engine.vanilla_engine import PanoVanillaEngine
-from inference_engine.streaming_window_engine import PanoStreamingEngine
+from inference_engine.streaming_window_engine_lc import StreamingWindowEngineLC
 
 from inference_engine.utils.masking import get_spherical_valid_mask
 from inference_engine.utils.visualization import visualize_polar_mask, visualize_depth
@@ -17,7 +17,7 @@ from inference_engine.utils.geometry import unproject_equirectangular_to_points
 print("Initializing Architecture Stack...")
 base_model_wrapper = PanoVGGTExtractor()
 vanilla_engine = PanoVanillaEngine(base_model_wrapper.model)
-streaming_engine = PanoStreamingEngine(vanilla_engine, window_size=3, overlap=2)
+streaming_engine = StreamingWindowEngineLC(vanilla_engine, window_size=3, overlap=2)
 
 
 def get_o3d_pcd(xyz_points, rgb_image, mask):
