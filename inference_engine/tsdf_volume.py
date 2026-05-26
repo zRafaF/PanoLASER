@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import open3d as o3d
 import time
+import trimesh # Required: pip install trimesh
 
 class FastStaticTSDF:
     def __init__(self, voxel_size=0.02, margin=0.08, max_depth=6.0, max_blocks=60000, device="cuda"):
@@ -157,128 +158,53 @@ class FastStaticTSDF:
             self.colors[idx_tensor] = old_colors.view(B, N, 3)
             self.min_dist[idx_tensor] = old_min_dist.view(B, N)
 
-    # --- FIX 1: GPU Spatial Voxel Downsampling ---
-    def extract_point_cloud(self, surface_threshold=None, viz_voxel_scale=4.0):
+    def extract_point_cloud(self, surface_threshold=None, max_points=2000000):
         t_start = time.time()
+        if self.next_idx == 0: return o3d.geometry.PointCloud()
+        if surface_threshold is None: surface_threshold = self.voxel_size * 2.0 
         
-        if self.next_idx == 0:
-            return o3d.geometry.PointCloud()
-            
-        if surface_threshold is None:
-            surface_threshold = self.voxel_size * 2.0 
-        
-        tsdf_vals = self.tsdf[:self.next_idx]
-        weights = self.weights[:self.next_idx]
-        
-        physical_sdf = tsdf_vals * self.margin
-        valid = (torch.abs(physical_sdf) <= surface_threshold) & (weights > 0)
+        physical_sdf = self.tsdf[:self.next_idx] * self.margin
+        valid = (torch.abs(physical_sdf) <= surface_threshold) & (self.weights[:self.next_idx] > 0)
         
         b_idx, v_idx = torch.where(valid)
-        
-        if len(b_idx) == 0:
-            return o3d.geometry.PointCloud()
+        if len(b_idx) == 0: return o3d.geometry.PointCloud()
             
-        valid_block_coords = self.block_coords_tensor[b_idx]
-        valid_local_coords = self.block_template[v_idx]
-        
-        coords = (valid_block_coords * self.block_size) + valid_local_coords
-        colors = self.colors[b_idx, v_idx]
-        
-        # GPU Native Voxel Downsampling (Keeps the entire history natively without limits)
-        if viz_voxel_scale > 1.0:
-            viz_voxel_size = self.voxel_size * viz_voxel_scale
-            grid_coords = torch.floor(coords / viz_voxel_size).long()
+        # Confidence-Weighted Decimation: keep highest weight points
+        if len(b_idx) > max_points:
+            point_weights = self.weights[:self.next_idx][b_idx, v_idx]
+            _, top_k_indices = torch.topk(point_weights, max_points)
+            b_idx, v_idx = b_idx[top_k_indices], v_idx[top_k_indices]
             
-            # PyTorch doesn't have return_indices, so we use return_inverse + scatter
-            # to map each voxel coordinate back to a single original point index.
-            uniques, inverse = torch.unique(grid_coords, dim=0, return_inverse=True)
-            unique_idx = torch.empty(uniques.size(0), dtype=torch.long, device=self.device)
-            src_indices = torch.arange(inverse.size(0), device=self.device)
-            unique_idx.scatter_(0, inverse, src_indices)
-            
-            coords = coords[unique_idx]
-            colors = colors[unique_idx]
+        coords = (self.block_coords_tensor[b_idx] * self.block_size) + self.block_template[v_idx]
+        colors = self.colors[:self.next_idx][b_idx, v_idx]
         
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(coords.cpu().numpy())
         pcd.colors = o3d.utility.Vector3dVector(colors.cpu().numpy())
-        
-        print(f"      [Profile - Extraction] GPU Spatial Extraction: {len(pcd.points)} points in {time.time() - t_start:.4f} sec")
         return pcd
 
     def extract_mesh(self, surface_threshold=None):
-        t_start = time.time()
         import skimage.measure
-        from scipy.spatial import cKDTree
         
-        if self.next_idx == 0:
-            return o3d.geometry.TriangleMesh()
-            
-        print("      [Profile - Extraction] Assembling GPU volume for Marching Cubes...")
+        # Assemble volumetric grid
         active_blocks = self.block_coords_tensor[:self.next_idx]
         min_b = active_blocks.min(dim=0)[0]
         max_b = active_blocks.max(dim=0)[0]
-        
-        grid_dim_blocks = (max_b - min_b) + 1
-        grid_shape = (grid_dim_blocks * self.block_res).cpu().numpy()
-        
+        grid_shape = ((max_b - min_b + 1) * self.block_res).cpu().numpy()
         dense_tsdf = torch.ones(tuple(grid_shape), dtype=torch.float32, device=self.device)
         
+        # Efficient assignment
         rel_blocks = active_blocks - min_b
-        voxel_coords_global = (rel_blocks.unsqueeze(1) * self.block_res)
+        valid_indices = (rel_blocks.unsqueeze(1) * self.block_res + self.block_template.unsqueeze(0)).view(-1, 3)
+        dense_tsdf[valid_indices[:,0].long(), valid_indices[:,1].long(), valid_indices[:,2].long()] = self.tsdf[:self.next_idx].view(-1)
         
-        x = torch.arange(self.block_res, device=self.device)
-        grid_x, grid_y, grid_z = torch.meshgrid(x, x, x, indexing='ij')
-        local_coords = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3)
+        # Marching Cubes
+        verts, faces, _, _ = skimage.measure.marching_cubes(dense_tsdf.cpu().numpy(), level=0.0)
+        verts_world = verts * self.voxel_size + (min_b.cpu().numpy() * self.block_size)
         
-        all_indices = (voxel_coords_global + local_coords.unsqueeze(0)).view(-1, 3)
-        
-        B = self.next_idx
-        weight_vals = self.weights[:B].view(-1)
-        valid_mask = weight_vals > 0
-        
-        valid_indices = all_indices[valid_mask]
-        valid_tsdf = self.tsdf[:B].view(-1)[valid_mask]
-        
-        dense_tsdf[valid_indices[:, 0], valid_indices[:, 1], valid_indices[:, 2]] = valid_tsdf
-        tsdf_vol = dense_tsdf.cpu().numpy()
-        
-        print("      [Profile - Extraction] Running Cython Marching Cubes...")
-        try:
-            verts, faces, normals, values = skimage.measure.marching_cubes(tsdf_vol, level=0.0)
-        except ValueError:
-            return o3d.geometry.TriangleMesh()
+        # Trimesh Simplification for performance
+        mesh = trimesh.Trimesh(vertices=verts_world, faces=faces)
+        if len(mesh.faces) > 500000:
+            mesh = mesh.simplify_quadratic_decimation(500000)
             
-        min_b_world = min_b.cpu().numpy() * self.block_size
-        verts_world = verts * self.voxel_size + min_b_world
-        
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices = o3d.utility.Vector3dVector(verts_world)
-        mesh.triangles = o3d.utility.Vector3iVector(faces)
-        
-        # --- FIX 1: Quadric Mesh Decimation ---
-        # 1 Million triangles creates a beautiful, sharp room that sits around 50MB. 
-        initial_triangles = len(mesh.triangles)
-        target_triangles = 1000000 
-        
-        if initial_triangles > target_triangles:
-            print(f"      [Profile - Extraction] Decimating flat surfaces: {initial_triangles} -> {target_triangles} triangles...")
-            mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target_triangles)
-        
-        # Calculate normals AFTER decimation for smooth rendering
-        mesh.compute_vertex_normals()
-        
-        print("      [Profile - Extraction] Colorizing Mesh via Vectorized cKDTree...")
-        pcd = self.extract_point_cloud(surface_threshold=self.voxel_size * 2, viz_voxel_scale=1.0)
-        pcd_verts = np.asarray(pcd.points)
-        pcd_colors = np.asarray(pcd.colors)
-        
-        # We query the KDTree against the newly decimated vertices
-        verts_world_decimated = np.asarray(mesh.vertices)
-        if len(pcd_verts) > 0 and len(verts_world_decimated) > 0:
-            tree = cKDTree(pcd_verts)
-            _, idx = tree.query(verts_world_decimated, k=1)
-            mesh.vertex_colors = o3d.utility.Vector3dVector(pcd_colors[idx])
-        
-        print(f"      [Profile - Extraction] Final Mesh extracted in {time.time() - t_start:.4f} sec")
         return mesh

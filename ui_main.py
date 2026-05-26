@@ -243,15 +243,15 @@ def process_sequence_ui(
     streaming_engine.overlap = int(overlap)
 
     for mesh, global_pcd, trajectory, lc_edges in streaming_engine.process_sequence(frames, masks):
-        
         fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, lc_edges)
-        pcd_path = save_pcd_to_ply(global_pcd, "live_stitched_map")
+        pcd_path = save_pcd_to_ply(global_pcd, "live_map")
         
+        # Only process mesh in the last yield (when mesh is not None)
         if mesh is None:
-            # Yield None instead of gr.skip() so Gradio initializes the container safely
             yield fig, pcd_path, None, None
         else:
-            mesh_path = save_mesh_to_glb(mesh, "final_stitched_mesh")
+            # This final yield sends the finalized, cleaned GLB
+            mesh_path = save_mesh_to_glb(mesh, "final_scene")
             yield fig, pcd_path, mesh_path, mesh_path
 
 
