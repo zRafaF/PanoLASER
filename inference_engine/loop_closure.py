@@ -3,8 +3,6 @@ import torch.nn.functional as F
 import numpy as np
 import torchvision.transforms as T
 
-from salad.eval import load_model
-
 class ImageRetrieval:
     def __init__(self, input_size=224, device=None):
         """
@@ -13,16 +11,18 @@ class ImageRetrieval:
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[SALAD] Loading Loop Closure Model on {self.device}...")
         
-        # 1. Load Model (Automatically finds your downloaded weights)
-        self.model = load_model()
+        # --- THE FIX: Restored the Torch Hub load that you successfully got working ---
+        print("[SALAD] Fetching architecture and weights from Torch Hub...")
+        self.model = torch.hub.load('serizba/salad', 'dinov2_salad', trust_repo=True)
+        
         self.model.to(self.device)
         self.model.eval()
         
-        # 2. Standard DINOv2 / ImageNet Normalization Stats
+        # Standard DINOv2 / ImageNet Normalization Stats
         MEAN = [0.485, 0.456, 0.406]
         STD = [0.229, 0.224, 0.225]
         
-        # 3. Vision Transformer Pipeline
+        # Vision Transformer Pipeline
         self.transform = T.Compose([
             T.ToPILImage(),
             T.Resize((input_size, input_size), interpolation=T.InterpolationMode.BILINEAR),
