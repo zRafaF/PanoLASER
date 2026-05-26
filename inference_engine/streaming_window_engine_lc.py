@@ -206,9 +206,12 @@ class StreamingWindowEngineLC:
             for j in range(self.window_size):
                 global_pose = optimized_anchor @ canonical_poses[j]
                 
-                if global_pose[1, 1] < 0:
+                # --- THE FIX: ISOLATE RENDERING POSE FROM TRACKING POSE ---
+                # Create a copy so we don't poison the Kabsch tracking targets
+                tsdf_pose = global_pose.copy()
+                if tsdf_pose[1, 1] < 0:
                     flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-                    global_pose[:3, :3] = global_pose[:3, :3] @ flip_R
+                    tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ flip_R
 
                 scaled_pts = pts_list[j] * self.current_metric_scale
                 depth_map = np.linalg.norm(scaled_pts, axis=-1)
@@ -217,11 +220,13 @@ class StreamingWindowEngineLC:
                     batch_depths.append(depth_map)
                     batch_rgbs.append(window_frames[j])
                     batch_masks.append(window_masks[j])
-                    batch_poses.append(global_pose)
+                    # Send the rendering pose to the TSDF
+                    batch_poses.append(tsdf_pose) 
                     
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
                         self.prev_overlap_global_poses = []
+                    # Keep the PRISTINE global pose for the continuous Kabsch chain
                     self.prev_overlap_global_poses.append(global_pose)
             
             self.prev_overlap_raw_pts = pts_list[-self.overlap:]
