@@ -188,7 +188,13 @@ class FastStaticTSDF:
         if viz_voxel_scale > 1.0:
             viz_voxel_size = self.voxel_size * viz_voxel_scale
             grid_coords = torch.floor(coords / viz_voxel_size).long()
-            _, unique_idx = torch.unique(grid_coords, dim=0, return_indices=True)
+            
+            # PyTorch doesn't have return_indices, so we use return_inverse + scatter
+            # to map each voxel coordinate back to a single original point index.
+            uniques, inverse = torch.unique(grid_coords, dim=0, return_inverse=True)
+            unique_idx = torch.empty(uniques.size(0), dtype=torch.long, device=self.device)
+            src_indices = torch.arange(inverse.size(0), device=self.device)
+            unique_idx.scatter_(0, inverse, src_indices)
             
             coords = coords[unique_idx]
             colors = colors[unique_idx]
