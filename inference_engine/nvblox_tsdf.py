@@ -2,7 +2,11 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import time
-import nvblox 
+
+# Correctly target the mapper submodule to avoid the root AttributeError
+import nvblox_torch
+from nvblox_torch.mapper import Mapper 
+from nvblox_torch.camera import Camera
 
 class NvbloxPanoTSDF:
     def __init__(self, voxel_size_m=0.01, max_depth=6.0, face_size=512, device="cuda"):
@@ -10,15 +14,15 @@ class NvbloxPanoTSDF:
         self.max_depth = max_depth
         self.face_size = face_size
         
-        print(f"[TSDF] Initializing dynamic GPU nvblox Mapper (Voxel Size: {voxel_size_m}m)...")
-        # The Mapper class resides in the base nvblox module.
-        self.mapper = nvblox.Mapper(voxel_size_m=voxel_size_m, memory_type=nvblox.MemoryType.kDevice)
+        print(f"[TSDF] Initializing dynamic GPU nvblox_torch Mapper (Voxel Size: {voxel_size_m}m)...")
+        
+        # Initialize the zero-copy PyTorch Mapper
+        self.mapper = Mapper(voxel_size_m=voxel_size_m)
         
         # 1. Setup Cubemap Pinhole Intrinsics (90 Degree FOV)
-        # focal_length = width / (2 * tan(FOV/2)) -> for 90 deg, f = width / 2
         f = self.face_size / 2.0
         c = self.face_size / 2.0
-        self.camera = nvblox.Camera(f, f, c, c, self.face_size, self.face_size)
+        self.camera = Camera(f, f, c, c, self.face_size, self.face_size)
         
         # 2. Precompute Grid Tensors for Fast Unrolling
         self._precompute_cubemap_grids()
@@ -29,6 +33,7 @@ class NvbloxPanoTSDF:
         v = torch.linspace(-1, 1, self.face_size, device=self.device)
         v_grid, u_grid = torch.meshgrid(v, u, indexing='ij')
         
+        # Define the 6 viewing directions (Front, Right, Back, Left, Top, Bottom)
         self.face_dirs = [
             torch.stack([u_grid, v_grid, torch.ones_like(u_grid)], dim=-1),   # Front (+Z)
             torch.stack([torch.ones_like(u_grid), v_grid, -u_grid], dim=-1),  # Right (+X)
@@ -38,6 +43,7 @@ class NvbloxPanoTSDF:
             torch.stack([u_grid, torch.ones_like(u_grid), -v_grid], dim=-1)   # Bottom (+Y)
         ]
         
+        # Face rotation matrices relative to the main robot pose
         self.face_rotations = [
             torch.eye(3, device=self.device), 
             torch.tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], device=self.device, dtype=torch.float32), 
@@ -61,7 +67,8 @@ class NvbloxPanoTSDF:
 
     @torch.no_grad()
     def integrate(self, pano_depth_map, pano_rgb, mask, pose):
-        """Slices the pano output into 6 faces and integrates them into nvblox."""
+        """Slices the pano output into 6 faces and integrates directly on GPU."""
+        # Fast conversion to GPU tensors if data arrives as numpy
         if isinstance(pano_depth_map, np.ndarray):
             pano_depth_map = torch.from_numpy(pano_depth_map).float().to(self.device)
         if isinstance(pose, np.ndarray):
@@ -70,25 +77,28 @@ class NvbloxPanoTSDF:
         pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0)
         
         for i in range(6):
-            # Extract pinhole depth image
+            # 1. Extract the pinhole depth image from the 360 map
             radial_depth = F.grid_sample(pano_depth_tensor, self.grids[i], mode='bilinear', align_corners=True).squeeze()
             
-            # Convert radial to optical Z-axis depth
+            # 2. Convert radial distance to optical Z-axis depth
             z_multiplier = F.normalize(self.face_dirs[i], p=2, dim=-1)[..., 2].abs()
             optical_depth = radial_depth * z_multiplier
             optical_depth[optical_depth > self.max_depth] = 0.0
             
-            # Global pose for this face
+            # 3. Calculate global pose for this face
             face_pose = pose.clone()
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
             
-            # nvblox C++ backend requires standard NumPy arrays
+            # 4. Zero-copy integration! Tensors stay on the GPU
             self.mapper.integrate_depth(
-                optical_depth.cpu().numpy(), 
-                face_pose.cpu().numpy(), 
+                optical_depth, 
+                face_pose, 
                 self.camera
             )
 
     def extract_mesh(self):
-        print("[TSDF] Generating dense planar mesh from nvblox...")
+        """nvblox handles meshing natively, outputting clean geometry."""
+        print("[TSDF] Generating dense planar mesh from nvblox_torch...")
+        # To avoid the old 'dense bounding box' RAM crash, nvblox only meshes 
+        # the blocks that contain surfaces.
         return self.mapper.generate_mesh()
