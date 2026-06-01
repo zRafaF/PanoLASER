@@ -6,9 +6,15 @@
 
 This project uses a locked fork of PanoVGGT as a submodule (commit `1857537`).
 
+
+
 ## ⚙️ Installation & Setup
 
-We use [`uv`](https://docs.astral.sh/uv/) for deterministic, lightning-fast project and dependency management.
+We use [`uv`](https://docs.astral.sh/uv/) for deterministic, lightning-fast project and dependency management.~
+
+### 0. Machine requirements
+
+nvblox requires an NVIDIA GPU with CUDA support. In cuda 12.8
 
 ### 1. Clone the Repository
 Because this project relies on a submodule, ensure you clone recursively:
@@ -46,6 +52,13 @@ uv sync
 > ```bash
 > uv sync --no-install-package gtsam
 > ```
+
+
+#### Install nvblox
+
+```bash
+UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install https://github.com/nvidia-isaac/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10+cu12ubuntu24-py3-none-linux_x86_64.whl
+```
 
 ### 3. Compile Cython Modules
 
