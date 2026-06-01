@@ -4,9 +4,9 @@ import open3d as o3d
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from .nvblox_tsdf import NvbloxPanoTSDF
 from .inference_utils import align_cam_pts_irls
 from .utils.geometry import register_camera_poses_kabsch
-from .tsdf_volume import FastStaticTSDF  
 from .pano_graph import PanoPoseGraph  
 from .loop_closure import ImageRetrieval
 
@@ -28,7 +28,7 @@ class StreamingWindowEngineLC:
         if self.tsdf_future is not None:
             self.tsdf_future.result()
             
-        self.tsdf = FastStaticTSDF(voxel_size=0.02, margin=0.08, max_depth=6.0, device=self.device)
+        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.01, max_depth=6.0, device=self.device)
         self.pose_graph = PanoPoseGraph()
         
         self.prev_overlap_raw_pts = []
@@ -240,9 +240,7 @@ class StreamingWindowEngineLC:
         # --- END OF SEQUENCE: EXPORT MESH ---
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
         
-        final_mesh = self.tsdf.extract_mesh(surface_threshold=0.02)
+        # nvblox generates exceptionally clean meshes inherently suited for planar walls
+        final_mesh = self.tsdf.extract_mesh() 
         
-        # Pass viz_voxel_scale=1.5 for the final dense point cloud export (2cm resolution)
-        final_pcd = self.tsdf.extract_point_cloud(surface_threshold=0.02, viz_voxel_scale=1.0)
-        
-        yield final_mesh, final_pcd, np.array(trajectory), lc_edges
+        yield final_mesh, None, np.array(trajectory), lc_edges
