@@ -1,12 +1,13 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-import time
 
-# Correctly target the mapper submodule to avoid the root AttributeError
-import nvblox_torch
-from nvblox_torch.mapper import Mapper 
-from nvblox_torch.camera import Camera
+# Correct imports matching the nvblox documentation
+import nvblox
+from nvblox.core.mapper import Mapper
+from nvblox.core.camera import Camera
+from nvblox.core.image import DepthImage
+from nvblox.core.types import Transform, MemoryType
 
 class NvbloxPanoTSDF:
     def __init__(self, voxel_size_m=0.01, max_depth=6.0, face_size=512, device="cuda"):
@@ -14,10 +15,13 @@ class NvbloxPanoTSDF:
         self.max_depth = max_depth
         self.face_size = face_size
         
-        print(f"[TSDF] Initializing dynamic GPU nvblox_torch Mapper (Voxel Size: {voxel_size_m}m)...")
+        print(f"[TSDF] Initializing nvblox Mapper (Voxel Size: {voxel_size_m}m)...")
         
-        # Initialize the zero-copy PyTorch Mapper
-        self.mapper = Mapper(voxel_size_m=voxel_size_m)
+        # Initialize the Mapper and explicitly set memory to the GPU device
+        self.mapper = Mapper(
+            voxel_size_m=voxel_size_m, 
+            memory_type=MemoryType.kDevice
+        )
         
         # 1. Setup Cubemap Pinhole Intrinsics (90 Degree FOV)
         f = self.face_size / 2.0
@@ -67,8 +71,8 @@ class NvbloxPanoTSDF:
 
     @torch.no_grad()
     def integrate(self, pano_depth_map, pano_rgb, mask, pose):
-        """Slices the pano output into 6 faces and integrates directly on GPU."""
-        # Fast conversion to GPU tensors if data arrives as numpy
+        """Slices the pano output into 6 faces and integrates via nvblox.core."""
+        # Ensure we are starting with tensors
         if isinstance(pano_depth_map, np.ndarray):
             pano_depth_map = torch.from_numpy(pano_depth_map).float().to(self.device)
         if isinstance(pose, np.ndarray):
@@ -85,20 +89,26 @@ class NvbloxPanoTSDF:
             optical_depth = radial_depth * z_multiplier
             optical_depth[optical_depth > self.max_depth] = 0.0
             
-            # 3. Calculate global pose for this face
+            # 3. Format depth for nvblox.core bindings
+            # Must convert to numpy float32, then wrap in DepthImage object
+            depth_np = optical_depth.cpu().numpy().astype(np.float32)
+            nvblox_depth = DepthImage(depth_np, memory_type=MemoryType.kDevice)
+            
+            # 4. Calculate global pose for this face and format for nvblox.core
             face_pose = pose.clone()
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
             
-            # 4. Zero-copy integration! Tensors stay on the GPU
+            face_pose_np = face_pose.cpu().numpy().astype(np.float32)
+            nvblox_pose = Transform(face_pose_np)
+            
+            # 5. Integrate!
             self.mapper.integrate_depth(
-                optical_depth, 
-                face_pose, 
+                nvblox_depth, 
+                nvblox_pose, 
                 self.camera
             )
 
     def extract_mesh(self):
         """nvblox handles meshing natively, outputting clean geometry."""
-        print("[TSDF] Generating dense planar mesh from nvblox_torch...")
-        # To avoid the old 'dense bounding box' RAM crash, nvblox only meshes 
-        # the blocks that contain surfaces.
+        print("[TSDF] Generating dense planar mesh from nvblox...")
         return self.mapper.generate_mesh()
