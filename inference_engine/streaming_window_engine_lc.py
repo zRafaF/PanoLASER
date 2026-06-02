@@ -28,7 +28,7 @@ class StreamingWindowEngineLC:
         if self.tsdf_future is not None:
             self.tsdf_future.result()
             
-        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.01, max_depth=6.0, device=self.device)
+        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.03, max_depth=4.0, device=self.device)
         self.pose_graph = PanoPoseGraph()
         
         self.prev_overlap_raw_pts = []
