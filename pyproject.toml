@@ -5,33 +5,41 @@ description = "Training-Free Streaming 3D Reconstruction from Panoramic Video"
 readme = "README.md"
 requires-python = "==3.11.*"
 dependencies = [
-    # PyTorch Ecosystem (Relaxed for RunPod 2.4.0 compatibility)
-    "torch>=2.4.0",
-    "torchvision>=0.19.0",
-    "torchaudio>=2.4.0",
+    # PyTorch Ecosystem (Pinned strictly for nvblox v0.0.10 C++ ABI compatibility)
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "torchaudio==2.4.1",
     "xformers>=0.0.27.post2",
+    
+    # Nvblox pre-compiled wheel
+    "nvblox-torch @ https://github.com/nvidia-isaac/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10+cu12ubuntu24-py3-none-linux_x86_64.whl",
+    
     # Core Math & Arrays
     "numpy==1.26.4",
     "scipy",
     "pandas",
+    
     # Image Processing & Vision
     "opencv-python",
     "pillow",
     "imageio",
     "scikit-image",
     "kornia",
+    
     # 3D & Geometry
     "open3d",
     "trimesh",
     "plyfile",
     "pypose",
     "evo",
+    
     # Model & Training Utils
     "einops",
     "huggingface-hub",
     "safetensors",
     "scikit-learn",
     "tensorboard",
+    
     # Configuration & System
     "hydra-core",
     "omegaconf",
@@ -40,6 +48,7 @@ dependencies = [
     "tqdm",
     "cython",
     "numba",
+    
     # Web / UI
     "gradio>=5.17.1",
     "fastapi==0.119.0",
@@ -65,4 +74,4 @@ xformers = { index = "pytorch-cu128" }
 
 # Inject PyTorch into the isolated build environment to prevent source-compilation crashes
 [tool.uv.extra-build-dependencies]
-xformers = ["torch>=2.4.0"]
+xformers = ["torch==2.9.1"]
