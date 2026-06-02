@@ -50,19 +50,15 @@ dependencies = [
     "pytorch-lightning>=2.6.5",
 ]
 
-# Tell uv where to find the CUDA 12.8 PyTorch wheels
+# Tell uv where to find the CUDA 12.6 PyTorch wheels
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 # Route the PyTorch ecosystem packages to the custom index
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-torchaudio = { index = "pytorch-cu128" }
-xformers = { index = "pytorch-cu128" }
-
-# Inject PyTorch into the isolated build environment to prevent source-compilation crashes
-[tool.uv.extra-build-dependencies]
-xformers = ["torch>=2.4.0"]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
+xformers = { index = "pytorch-cu126" }
