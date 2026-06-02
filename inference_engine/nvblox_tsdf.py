@@ -112,9 +112,9 @@ class NvbloxPanoTSDF:
             # FIX 2: Nvblox explicitly checks that transformation matrices are on the CPU!
             face_pose_cpu = face_pose.cpu()
             
-            # FIX 3: Changed 'integrate_depth' to 'add_depth_frame'
+            # FIX 3: Changed 'integrate_depth' to 'add_depth_frame' and made contiguous
             self.mapper.add_depth_frame(
-                optical_depth, 
+                optical_depth.contiguous(), # Force flat memory layout 
                 face_pose_cpu, 
                 self.camera
             )
@@ -123,7 +123,8 @@ class NvbloxPanoTSDF:
             if use_color:
                 rgb_face = F.grid_sample(pano_rgb_tensor, self.grids[i], mode='bilinear', align_corners=True).squeeze()
                 # Nvblox specifically requires the image to be (H, W, 3) and uint8
-                rgb_face_uint8 = rgb_face.permute(1, 2, 0).to(torch.uint8)
+                rgb_face_uint8 = rgb_face.permute(1, 2, 0).to(torch.uint8).contiguous() # Force flat memory layout
+                
                 self.mapper.add_color_frame(
                     rgb_face_uint8,
                     face_pose_cpu,
