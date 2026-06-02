@@ -80,6 +80,8 @@ class StreamingWindowEngineLC:
             preds = self.engine(window_frames)
             torch.cuda.synchronize()  
             print(f"  [Profile] VGGT Inference: {time.time() - t_gpu:.4f} sec")
+
+            torch.cuda.empty_cache()
             
             pts_list = preds["points"] 
             poses = preds["poses"]
