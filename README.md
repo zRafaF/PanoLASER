@@ -82,6 +82,30 @@ wget https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt -O checkpoi
 sh ./scripts/download_weights.sh
 ``` -->
 
+### 5. Installing nvblox from source
+
+```bash
+apt-get update && apt-get install -y git-lfs cmake build-essential python3-dev
+git lfs install
+git clone https://github.com/nvidia-isaac/nvblox.git
+cd nvblox
+
+
+
+# Ensure your uv virtual environment is active so CMake finds your specific PyTorch
+source /root/PanoLASER/.venv/bin/activate
+
+# Build the C++ library (Do NOT pass -DBUILD_PYTORCH_WRAPPER=0 here)
+mkdir build && cd build
+cmake .. -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch.utils; print(torch.utils.cmake_prefix_path)')" -DBUILD_RENDERER=0
+
+# Compile it
+make -j$(nproc)
+
+cd ../nvblox_torch
+uv pip install --editable .
+```
+
 ## 🚀 Usage
 
 Whenever you execute scripts or run tests in this repository, prepend your command with `uv run` to automatically trigger execution inside the locked dependencies network without manually activating anything:

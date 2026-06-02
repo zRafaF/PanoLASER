@@ -6,7 +6,7 @@ import time
 
 # --- FIX: Explicitly import the classes from their submodules ---
 from nvblox_torch.mapper import Mapper
-from nvblox_torch.camera import Camera
+from nvblox_torch.sensor import Camera
 # ----------------------------------------------------------------
 
 class NvbloxPanoTSDF:
