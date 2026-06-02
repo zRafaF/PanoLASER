@@ -3,10 +3,9 @@ name = "panolaser"
 version = "0.1.0"
 description = "Training-Free Streaming 3D Reconstruction from Panoramic Video"
 readme = "README.md"
-requires-python = "==3.10.*"
+requires-python = "==3.11.*"
 dependencies = [
-    # PyTorch Ecosystem (Relaxed for RunPod 2.4.0 compatibility)
-    "torch==2.4.0",
+    "torch==2.4.*",
     "torchvision>=0.19.0",
     "torchaudio>=2.4.0",
     "xformers>=0.0.27.post2",
@@ -45,20 +44,23 @@ dependencies = [
     "fastapi==0.119.0",
     "flask==3.1.2",
     "plotly>=6.7.0",
-    "gtsam>=4.2.1",
+    "gtsam>=4.2.1; sys_platform == 'linux'", # Safely ignores Windows dev locks
     "pytorch-metric-learning>=2.9.0",
     "pytorch-lightning>=2.6.5",
 ]
 
-# Tell uv where to find the CUDA 12.6 PyTorch wheels
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
-# Route the PyTorch ecosystem packages to the custom index
 [tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-torchvision = { index = "pytorch-cu126" }
-torchaudio = { index = "pytorch-cu126" }
-xformers = { index = "pytorch-cu126" }
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
+xformers = { index = "pytorch-cu124" }
+
+# Inject PyTorch into the isolated build environment to prevent source-compilation crashes
+[tool.uv.extra-build-dependencies]
+xformers = ["torch>=2.4.0"]
+panolaser = ["Cython", "numpy"]
