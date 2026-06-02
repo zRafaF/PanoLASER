@@ -4,7 +4,7 @@ import numpy as np
 import open3d as o3d
 import time
 
-# --- FIX: Explicitly import the classes from their submodules ---
+# --- Explicitly import the classes from their new submodules ---
 from nvblox_torch.mapper import Mapper
 from nvblox_torch.sensor import Sensor
 # ----------------------------------------------------------------
@@ -12,13 +12,13 @@ from nvblox_torch.sensor import Sensor
 class NvbloxPanoTSDF:
     def __init__(self, voxel_size_m=0.01, max_depth=6.0, face_size=512, device="cuda"):
         self.device = device
+        self.voxel_size_m = voxel_size_m
         self.max_depth = max_depth
         self.face_size = face_size
         
         print(f"[TSDF] Initializing dynamic GPU nvblox Mapper (Voxel Size: {voxel_size_m}m)...")
-        # nvblox dynamically allocates memory; no max_blocks required!
-        # FIX: Use the imported Mapper class directly
-        self.mapper = Mapper(voxel_size_m=voxel_size_m)
+        # FIX 1: The API expects the plural 'voxel_sizes_m'
+        self.mapper = Mapper(voxel_sizes_m=self.voxel_size_m)
         
         # 1. Setup Cubemap Pinhole Intrinsics (90 Degree FOV)
         f = self.face_size / 2.0
@@ -86,10 +86,16 @@ class NvbloxPanoTSDF:
             
         pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0)
         
+        # Color integration setup
+        use_color = pano_rgb is not None
+        if use_color:
+            if isinstance(pano_rgb, np.ndarray):
+                pano_rgb = torch.from_numpy(pano_rgb).float().to(self.device)
+            pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0)
+        
         # For each of the 6 faces of the cube...
         for i in range(6):
             # 1. Extract the pinhole depth image from the 360 map
-            # Note: PanoVGGT outputs Euclidean radial distance. Pinhole cameras expect optical-Z depth.
             radial_depth = F.grid_sample(pano_depth_tensor, self.grids[i], mode='bilinear', align_corners=True).squeeze()
             
             # Convert radial distance to optical Z-axis depth (Z = r * cos(angle))
@@ -103,15 +109,45 @@ class NvbloxPanoTSDF:
             face_pose = pose.clone()
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
             
-            # 3. Integrate directly via zero-copy PyTorch bridge
-            self.mapper.integrate_depth(
+            # FIX 2: Nvblox explicitly checks that transformation matrices are on the CPU!
+            face_pose_cpu = face_pose.cpu()
+            
+            # FIX 3: Changed 'integrate_depth' to 'add_depth_frame'
+            self.mapper.add_depth_frame(
                 optical_depth, 
-                face_pose, 
+                face_pose_cpu, 
                 self.camera
             )
+            
+            # 3b. Inject the RGB color texture map into the TSDF volume
+            if use_color:
+                rgb_face = F.grid_sample(pano_rgb_tensor, self.grids[i], mode='bilinear', align_corners=True).squeeze()
+                # Nvblox specifically requires the image to be (H, W, 3) and uint8
+                rgb_face_uint8 = rgb_face.permute(1, 2, 0).to(torch.uint8)
+                self.mapper.add_color_frame(
+                    rgb_face_uint8,
+                    face_pose_cpu,
+                    self.camera
+                )
+
+    def extract_point_cloud(self, surface_threshold=0.02, viz_voxel_scale=4.0):
+        """Extracts a sparse point cloud for live Slam previewing."""
+        # Nvblox natively extracts meshes perfectly, so we can just grab the vertices
+        self.mapper.update_color_mesh()
+        o3d_mesh = self.mapper.get_color_mesh().to_open3d()
+        
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d_mesh.vertices
+        pcd.colors = o3d_mesh.vertex_colors
+        
+        if viz_voxel_scale > 1.0:
+            voxel_size = self.voxel_size_m * viz_voxel_scale
+            pcd = pcd.voxel_down_sample(voxel_size)
+            
+        return pcd
 
     def extract_mesh(self):
         """nvblox handles meshing natively, bypassing marching cubes bottlenecks."""
         print("[TSDF] Generating dense planar mesh from nvblox...")
-        # nvblox natively generates and updates meshes from the TSDF volume
-        return self.mapper.generate_mesh()
+        self.mapper.update_color_mesh()
+        return self.mapper.get_color_mesh().to_open3d()
