@@ -3,7 +3,7 @@ name = "panolaser"
 version = "0.1.0"
 description = "Training-Free Streaming 3D Reconstruction from Panoramic Video"
 readme = "README.md"
-requires-python = "==3.11.*"
+requires-python = "==3.10.*"
 dependencies = [
     # PyTorch Ecosystem (Relaxed for RunPod 2.4.0 compatibility)
     "torch==2.4.0",
