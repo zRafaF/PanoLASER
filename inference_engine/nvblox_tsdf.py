@@ -6,7 +6,7 @@ import time
 
 # --- FIX: Explicitly import the classes from their submodules ---
 from nvblox_torch.mapper import Mapper
-from nvblox_torch.sensor import Camera
+from nvblox_torch.sensor import Sensor
 # ----------------------------------------------------------------
 
 class NvbloxPanoTSDF:
@@ -21,11 +21,18 @@ class NvbloxPanoTSDF:
         self.mapper = Mapper(voxel_size_m=voxel_size_m)
         
         # 1. Setup Cubemap Pinhole Intrinsics (90 Degree FOV)
-        # focal_length = width / (2 * tan(FOV/2)) -> for 90 deg, f = width / 2
         f = self.face_size / 2.0
         c = self.face_size / 2.0
-        # FIX: Use the imported Camera class directly
-        self.camera = Camera(f, f, c, c, self.face_size, self.face_size)
+        
+        # Use the new unified Sensor factory
+        self.camera = Sensor.from_camera(
+            fu=f, 
+            fv=f, 
+            cu=c, 
+            cv=c, 
+            width=self.face_size, 
+            height=self.face_size
+        )
         
         # 2. Precompute Grid Tensors for Fast Unrolling
         self._precompute_cubemap_grids()
