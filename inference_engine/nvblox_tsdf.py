@@ -62,94 +62,66 @@ class NvbloxPanoTSDF:
 
     @torch.no_grad()
     def integrate(self, pano_depth_map, pano_rgb, mask, pose):
+        # 1. Initialize variables to None to prevent UnboundLocalError
+        radial_depth = None
+        
         if isinstance(pano_depth_map, np.ndarray):
             pano_depth_map = torch.from_numpy(pano_depth_map).float().to(self.device)
             pose = torch.from_numpy(pose).float().to(self.device)
             
-        # 1. Prepare explicit PyTorch Mask Tensor
         if mask is not None:
-            if isinstance(mask, np.ndarray):
-                mask = torch.from_numpy(mask.copy()).float().to(self.device)
-            else:
-                mask = mask.float()
+            mask = torch.from_numpy(mask.copy()).float().to(self.device)
         else:
             mask = torch.ones_like(pano_depth_map)
             
-        # --- THE EDGE SHAVE FIX ---
-        # Generate a rigid border mask to ignore the highly distorted edges of the projection
-        border_size = int(self.face_size * 0.05) # Shave 5% off the edges
-        face_border_mask = torch.zeros((1, 1, self.face_size, self.face_size), device=self.device)
-        face_border_mask[..., border_size:-border_size, border_size:-border_size] = 1.0
-        
-        use_color = pano_rgb is not None
-        if use_color and isinstance(pano_rgb, np.ndarray):
-            pano_rgb = torch.from_numpy(pano_rgb).float().to(self.device)
-            
         pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0)
         pano_mask_tensor = mask.unsqueeze(0).unsqueeze(0)
-        pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0) if use_color else None
+        pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0) if pano_rgb is not None else None
 
         for i in range(6):
-            # 2. Slice the global mask
-            face_mask = F.grid_sample(
-                pano_mask_tensor,
-                self.batched_grids[i:i+1],
-                mode='nearest',
-                align_corners=True
-            ).squeeze(0).squeeze(0)
-            
-            # Combine the global valid mask with our new rigid border mask
-            face_mask = face_mask * face_border_mask.squeeze()
-            
-            optical_depth = radial_depth * self.batched_z_mults[i]
-            
-            # 3. STRICT INVALIDATION
-            # nvblox ignores any depth < 0.0. This completely stops fake geometry.
-            optical_depth[face_mask < 0.5] = -1.0
-            optical_depth[optical_depth > self.max_depth] = -1.0
-            optical_depth[optical_depth <= 0.01] = -1.0 
-            
-            color_face_uint8 = None
-            if use_color:
-                # Color can stay bilinear for visual smoothness
-                color_face = F.grid_sample(
-                    pano_rgb_tensor, 
+            try:
+                # 2. Slice the map
+                radial_depth = F.grid_sample(
+                    pano_depth_tensor, 
                     self.batched_grids[i:i+1], 
-                    mode='bilinear', 
+                    mode='nearest', 
                     align_corners=True
-                ).squeeze(0)
-                color_face_uint8 = color_face.permute(1, 2, 0).to(torch.uint8).contiguous()
-
-            face_pose = pose.clone()
-            face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
-            face_pose_cpu = face_pose.cpu()
-            
-            # Memory clearance before entering C++ backend
-            del radial_depth, face_mask, face_pose
-            if use_color:
-                del color_face
-            torch.cuda.empty_cache()
-            
-            self.mapper.add_depth_frame(
-                optical_depth.contiguous(), 
-                face_pose_cpu, 
-                self.camera
-            )
-            
-            if use_color:
-                self.mapper.add_color_frame(
-                    color_face_uint8,
-                    face_pose_cpu,
+                ).squeeze(0).squeeze(0)
+                
+                face_mask = F.grid_sample(
+                    pano_mask_tensor,
+                    self.batched_grids[i:i+1],
+                    mode='nearest',
+                    align_corners=True
+                ).squeeze(0).squeeze(0)
+                
+                optical_depth = radial_depth * self.batched_z_mults[i]
+                optical_depth[face_mask < 0.5] = -1.0
+                optical_depth[optical_depth > self.max_depth] = -1.0
+                
+                face_pose = pose.clone()
+                face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
+                face_pose_cpu = face_pose.cpu()
+                
+                # 3. Integrate into nvblox
+                self.mapper.add_depth_frame(
+                    optical_depth.contiguous(), 
+                    face_pose_cpu, 
                     self.camera
                 )
-                del color_face_uint8
                 
-            del optical_depth, face_pose_cpu
+                # Cleanup local loop variables
+                del radial_depth, optical_depth, face_pose, face_mask
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print("[TSDF] !! CRITICAL OOM during integration. Skipping sub-frame...")
+                    torch.cuda.empty_cache()
+                else:
+                    raise e
 
         # Final cleanup
-        del pano_depth_tensor, pano_mask_tensor, pano_depth_map, pose, mask
-        if use_color:
-            del pano_rgb_tensor, pano_rgb
+        del pano_depth_tensor, pano_mask_tensor, pano_depth_map, pose
         torch.cuda.empty_cache()
 
     def extract_point_cloud(self, surface_threshold=0.02, viz_voxel_scale=4.0):
