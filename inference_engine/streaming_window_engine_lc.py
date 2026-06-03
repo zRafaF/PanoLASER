@@ -78,27 +78,27 @@ class StreamingWindowEngineLC:
             
             print(f"\n[Engine] Processing Submap {self.submap_count}...")
             
-            # --- AGGRESSIVE MEMORY MANAGEMENT ---
             torch.cuda.empty_cache() 
             
             t_gpu = time.time()
             
-            # Ensure no gradients are tracked to save massive amounts of VRAM
             with torch.inference_mode():
                 preds = self.engine(window_frames)
                 
             torch.cuda.synchronize()  
             print(f"  [Profile] VGGT Inference: {time.time() - t_gpu:.4f} sec")
 
-            # Clear cache again after inference before passing tensors to Open3D
+            # Extricate data from the PyTorch graph and delete it IMMEDIATELY
+            pts_list = [p.cpu().numpy() if isinstance(p, torch.Tensor) else p for p in preds["points"]]
+            poses = [p.cpu().numpy() if isinstance(p, torch.Tensor) else p for p in preds["poses"]]
+            del preds 
             torch.cuda.empty_cache()
-            
-            pts_list = preds["points"] 
-            poses = preds["poses"]
             
             mid_idx = self.window_size // 2
             mid_frame = window_frames[mid_idx]
-            current_emb = self.retriever.get_single_embeding(mid_frame)
+            
+            # FIX: Explicitly cast the embedding to CPU to prevent a dictionary memory leak
+            current_emb = self.retriever.get_single_embeding(mid_frame).cpu()
             
             self.lc_embeddings[self.submap_count] = current_emb
             self.lc_anchor_frames[self.submap_count] = mid_frame

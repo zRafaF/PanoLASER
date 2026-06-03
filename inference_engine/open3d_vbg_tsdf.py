@@ -13,7 +13,7 @@ class Open3DPanoVBG:
             o3d_dev_str += ":0"
             
         self.o3d_device = o3d.core.Device(o3d_dev_str)
-        self.cpu_device = o3d.core.Device("CPU:0") # Explicit CPU device for matrices
+        self.cpu_device = o3d.core.Device("CPU:0") 
         
         self.voxel_size_m = voxel_size_m
         self.max_depth = max_depth
@@ -27,11 +27,10 @@ class Open3DPanoVBG:
             attr_channels=[[1], [1], [3]],
             voxel_size=self.voxel_size_m,
             block_resolution=16,
-            block_count=25000, 
+            block_count=18000, # Reduced to guarantee PyTorch has breathing room
             device=self.o3d_device
         )
         
-        # Intrinsics mapped strictly to CPU
         f = self.face_size / 2.0
         c = self.face_size / 2.0
         self.intrinsic_np = np.array([
@@ -44,7 +43,6 @@ class Open3DPanoVBG:
         self._precompute_cubemap_grids()
 
     def _precompute_cubemap_grids(self):
-        """Precomputes and stacks the PyTorch grids for vectorized 6-face sampling."""
         u = torch.linspace(-1, 1, self.face_size, device=self.torch_device)
         v = torch.linspace(-1, 1, self.face_size, device=self.torch_device)
         v_grid, u_grid = torch.meshgrid(v, u, indexing='ij')
@@ -59,16 +57,15 @@ class Open3DPanoVBG:
         ]
         
         self.face_rotations = [
-            torch.eye(3, device=self.torch_device), # Front
-            torch.tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], device=self.torch_device, dtype=torch.float32), # Right
-            torch.tensor([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], device=self.torch_device, dtype=torch.float32), # Back
-            torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]], device=self.torch_device, dtype=torch.float32), # Left
-            torch.tensor([[1, 0, 0], [0, 0, 1], [0, -1, 0]], device=self.torch_device, dtype=torch.float32), # Top
-            torch.tensor([[1, 0, 0], [0, 0, -1], [0, 1, 0]], device=self.torch_device, dtype=torch.float32), # Bottom
+            torch.eye(3, device=self.torch_device), 
+            torch.tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], device=self.torch_device, dtype=torch.float32), 
+            torch.tensor([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], device=self.torch_device, dtype=torch.float32), 
+            torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]], device=self.torch_device, dtype=torch.float32), 
+            torch.tensor([[1, 0, 0], [0, 0, 1], [0, -1, 0]], device=self.torch_device, dtype=torch.float32), 
+            torch.tensor([[1, 0, 0], [0, 0, -1], [0, 1, 0]], device=self.torch_device, dtype=torch.float32), 
         ]
         
         grids = []
-        z_mults = []
         for d in face_dirs:
             d_norm = F.normalize(d, p=2, dim=-1)
             X, Y, Z = d_norm[..., 0], d_norm[..., 1], d_norm[..., 2]
@@ -79,15 +76,15 @@ class Open3DPanoVBG:
             u_norm = theta / torch.pi
             v_norm = phi / (torch.pi / 2.0)
             grids.append(torch.stack([u_norm, v_norm], dim=-1))
-            z_mults.append(Z.abs())
             
-        # Stack into single tensors for 1-shot batch processing [6, H, W, ...]
+        # BUG FIX: Optical depth multiplier is independent of the sphere axis.
+        # It's purely based on the pinhole ray projection!
+        z_mult = 1.0 / torch.sqrt(u_grid**2 + v_grid**2 + 1.0)
+        self.batched_z_mults = z_mult.unsqueeze(0).expand(6, -1, -1)
         self.batched_grids = torch.stack(grids, dim=0)
-        self.batched_z_mults = torch.stack(z_mults, dim=0)
 
     @torch.no_grad()
     def integrate(self, pano_depth_map, pano_rgb, mask, pose):
-        """Zero-copy, batched integration."""
         if isinstance(pano_depth_map, np.ndarray):
             pano_depth_map = torch.from_numpy(pano_depth_map).float().to(self.torch_device)
             pose = torch.from_numpy(pose).float().to(self.torch_device)
@@ -96,7 +93,6 @@ class Open3DPanoVBG:
         if use_color and isinstance(pano_rgb, np.ndarray):
             pano_rgb = torch.from_numpy(pano_rgb).float().to(self.torch_device)
 
-        # 1. BATCHED PYTORCH SAMPLING (All 6 faces in one GPU kernel)
         pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0).expand(6, -1, -1, -1)
         radial_depths = F.grid_sample(pano_depth_tensor, self.batched_grids, mode='bilinear', align_corners=True).squeeze(1)
         
@@ -109,12 +105,10 @@ class Open3DPanoVBG:
             color_faces = F.grid_sample(pano_rgb_tensor, self.batched_grids, mode='bilinear', align_corners=True)
             color_faces = color_faces.permute(0, 2, 3, 1) / 255.0
 
-        # 2. Sequential Open3D Insertion (Extrinsics mapped to CPU)
         for i in range(6):
             face_pose = pose.clone()
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
             
-            # Open3D strictly requires extrinsics on CPU
             extrinsic_np = torch.linalg.inv(face_pose).cpu().numpy()
             extrinsic_o3d = o3d.core.Tensor(extrinsic_np, o3d.core.float64, self.cpu_device)
             
@@ -140,6 +134,13 @@ class Open3DPanoVBG:
                 depth_scale=1.0,
                 depth_max=self.max_depth
             )
+
+        # --- AGGRESSIVE MEMORY CLEANUP ---
+        # Frees the background thread tensors so PyTorch can safely reuse VRAM
+        del pano_depth_tensor, radial_depths, optical_depths
+        if use_color:
+            del color_faces, pano_rgb_tensor
+        torch.cuda.empty_cache()
 
     def extract_point_cloud(self):
         return self.vbg.extract_point_cloud(weight_threshold=3.0).to_legacy()
