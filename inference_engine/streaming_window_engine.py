@@ -51,11 +51,7 @@ class StreamingWindowEngine:
         # FORCE A FRESH MAPPER FOR EACH SUBMAP TO AVOID MEMORY ACCUMULATION
         # (Your loop is already doing this, but ensure the integration is tight)
         for j in range(len(poses)):
-            # ONLY integrate frames that are significantly different from previous ones
             self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
-        
-        # CLEAR THE MESH BUFFER HERE to stop the 'IndexSet too large' error
-        self.tsdf.mapper.clear_mesh() 
         
         local_pcd = self.tsdf.extract_point_cloud(viz_voxel_scale=1.0)
         local_mesh = self.tsdf.extract_mesh()
