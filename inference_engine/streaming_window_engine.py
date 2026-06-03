@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import open3d as o3d
 import time
-import gc  # <-- REQUIRED TO FORCE C++ VRAM DESTRUCTION
+import gc  
 from concurrent.futures import ThreadPoolExecutor
 
 from .nvblox_tsdf import NvbloxPanoTSDF
@@ -47,14 +47,15 @@ class StreamingWindowEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def _async_tsdf_task(self, tsdf_instance, depth_maps, rgb_frames, masks, poses):
+    # Removed tsdf_instance from args. We will use self.tsdf to avoid thread-caching leaks.
+    def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
         t_start = time.time()
         for j in range(len(poses)):
-            tsdf_instance.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
+            self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
         torch.cuda.synchronize()
         
-        local_pcd = tsdf_instance.extract_point_cloud(viz_voxel_scale=4.0)
-        local_mesh = tsdf_instance.extract_mesh()
+        local_pcd = self.tsdf.extract_point_cloud(viz_voxel_scale=4.0)
+        local_mesh = self.tsdf.extract_mesh()
         
         return local_mesh, local_pcd
 
@@ -77,19 +78,17 @@ class StreamingWindowEngine:
                 self.global_pcd += local_pcd
                 self.global_mesh += local_mesh
                 
-                # THE MEMORY LEAK FIX:
-                # The Future holds a hard reference to the thread's arguments (the old nvblox).
-                # We MUST delete the Future to release the C++ object!
                 del self.tsdf_future
                 self.tsdf_future = None
-                
-                # Delete the main thread's pointer
                 del self.tsdf
                 self.tsdf = None
                 
-                # Force Python to instantly execute PyBind11's C++ destructors
                 gc.collect()
                 torch.cuda.empty_cache()
+                
+                # THE SILVER BULLET: Flush the ThreadPoolExecutor's hidden cache
+                # Submitting a dummy task overwrites the thread's previous memory footprint.
+                self.tsdf_executor.submit(lambda: None).result()
             
             # --- PHASE 2: VGGT TRANSFORMER INFERENCE ---
             t_gpu = time.time()
@@ -105,6 +104,10 @@ class StreamingWindowEngine:
             
             # --- SCALE AND POSE ALIGNMENT ---
             if self.is_first_window:
+                # ====================================================================
+                # 🚨 IMPLEMENT YOUR CAMERA HEIGHT SCALE FIX HERE 🚨
+                # The median guess below was causing the arbitrary volume explosions!
+                # ====================================================================
                 first_depth = np.linalg.norm(pts_list[0], axis=-1)
                 valid_depths = first_depth[first_depth > 0.1]
                 if len(valid_depths) > 0:
@@ -166,16 +169,16 @@ class StreamingWindowEngine:
             self.is_first_window = False
 
             # --- PHASE 3: NVBLOX GPU INTEGRATION ---
-            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=5.0, device=self.device)
+            # Dropped voxel_size to 2cm (0.02) to give you extra VRAM buffer while fixing scale
+            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.02, max_depth=4.5, device=self.device)
             
             self.tsdf_future = self.tsdf_executor.submit(
-                self._async_tsdf_task, self.tsdf, batch_depths, batch_rgbs, batch_masks, batch_poses
+                self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
             )
             
             self.submap_count += 1
             print(f"  [Profile] Cycle Time: {time.time() - t_win_start:.4f} sec")
             
-            # --- GRADIO CRASH FIX ---
             safe_pcd = self.global_pcd
             if len(safe_pcd.points) == 0:
                 safe_pcd = o3d.geometry.PointCloud()
