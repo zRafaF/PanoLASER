@@ -14,7 +14,11 @@ We use [`uv`](https://docs.astral.sh/uv/) for deterministic, lightning-fast proj
 
 ### 0. Machine requirements
 
-nvblox requires an NVIDIA GPU with CUDA support. In cuda 12.8
+nvblox requires an NVIDIA GPU with CUDA support.
+
+Linux 12.04
+CUDA 12.4
+Python 3.11
 
 ### 1. Clone the Repository
 Because this project relies on a submodule, ensure you clone recursively:
@@ -87,10 +91,8 @@ sh ./scripts/download_weights.sh
 ```bash
 apt-get update && apt-get install -y git-lfs cmake build-essential python3-dev
 git lfs install
-git clone https://github.com/nvidia-isaac/nvblox.git
+git clone -b v0.0.10 https://github.com/nvidia-isaac/nvblox.git
 cd nvblox
-
-
 
 # Ensure your uv virtual environment is active so CMake finds your specific PyTorch
 source /root/PanoLASER/.venv/bin/activate
