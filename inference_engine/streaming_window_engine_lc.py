@@ -78,11 +78,19 @@ class StreamingWindowEngineLC:
             
             print(f"\n[Engine] Processing Submap {self.submap_count}...")
             
+            # --- AGGRESSIVE MEMORY MANAGEMENT ---
+            torch.cuda.empty_cache() 
+            
             t_gpu = time.time()
-            preds = self.engine(window_frames)
+            
+            # Ensure no gradients are tracked to save massive amounts of VRAM
+            with torch.inference_mode():
+                preds = self.engine(window_frames)
+                
             torch.cuda.synchronize()  
             print(f"  [Profile] VGGT Inference: {time.time() - t_gpu:.4f} sec")
 
+            # Clear cache again after inference before passing tensors to Open3D
             torch.cuda.empty_cache()
             
             pts_list = preds["points"] 

@@ -29,7 +29,7 @@ class Open3DPanoVBG:
             attr_channels=[[1], [1], [3]],
             voxel_size=self.voxel_size_m,
             block_resolution=16,
-            block_count=100000,
+            block_count=25000,
             device=self.o3d_device
         )
         
