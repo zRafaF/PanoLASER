@@ -129,9 +129,7 @@ class Open3DPanoVBG:
             block_coords = self.vbg.compute_unique_block_coordinates(
                 depth_o3d, self.intrinsic_o3d, extrinsic_o3d, depth_scale=1.0, depth_max=self.max_depth
             )
-            
-            self.vbg.hashmap().insert(block_coords, o3d.core.Tensor([1], o3d.core.uint8, self.o3d_device))
-            
+                        
             self.vbg.integrate(
                 block_coords=block_coords,
                 depth=depth_o3d,
