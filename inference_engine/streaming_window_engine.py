@@ -20,7 +20,7 @@ class StreamingWindowEngine:
         self.tsdf_future = None
         self.tsdf = None
         
-        print("[Engine] Initializing Chunked RAM-Offloading Odometry Engine...")
+        print("[Engine] Initializing Chunked RAM-Offloading Odometry Engine (with ICP & Zipper)...")
         self.reset()
         
     def reset(self):
@@ -47,15 +47,15 @@ class StreamingWindowEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Removed tsdf_instance from args. We will use self.tsdf to avoid thread-caching leaks.
-    def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
+    def _async_tsdf_task(self, tsdf_instance, depth_maps, rgb_frames, masks, poses):
         t_start = time.time()
         for j in range(len(poses)):
-            self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
+            tsdf_instance.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
         torch.cuda.synchronize()
         
-        local_pcd = self.tsdf.extract_point_cloud(viz_voxel_scale=4.0)
-        local_mesh = self.tsdf.extract_mesh()
+        # Pull raw, undecimated point cloud for highly accurate CPU ICP alignment
+        local_pcd = tsdf_instance.extract_point_cloud(viz_voxel_scale=1.0)
+        local_mesh = tsdf_instance.extract_mesh()
         
         return local_mesh, local_pcd
 
@@ -71,13 +71,35 @@ class StreamingWindowEngine:
             
             print(f"\n[Engine] Processing Submap {self.submap_count}...")
             
-            # --- PHASE 1: RECLAIM GPU VRAM ---
+            # --- PHASE 1: RECLAIM GPU VRAM & FUSE CHUNKS ---
             if self.tsdf_future is not None:
                 local_mesh, local_pcd = self.tsdf_future.result()
                 
+                # 1. Estimate normals for Point-to-Plane ICP
+                local_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+                
+                if len(self.global_pcd.points) > 0:
+                    self.global_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+                    
+                    # 2. ICP Alignment: "Snap" the new chunk into the global map to eliminate drift
+                    print("  [CPU] Snapping chunk via ICP...")
+                    icp_result = o3d.pipelines.registration.registration_icp(
+                        local_pcd, self.global_pcd, 
+                        max_correspondence_distance=0.15, # 15cm search radius for overlap correction
+                        init=np.eye(4),
+                        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane()
+                    )
+                    local_pcd.transform(icp_result.transformation)
+                    local_mesh.transform(icp_result.transformation)
+                
+                # 3. Add to the global map
                 self.global_pcd += local_pcd
                 self.global_mesh += local_mesh
                 
+                # 4. THE ZIPPER: Fuse duplicate overlapping points into single razor-sharp walls!
+                self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.015)
+                
+                # Clean up memory leak
                 del self.tsdf_future
                 self.tsdf_future = None
                 del self.tsdf
@@ -85,9 +107,6 @@ class StreamingWindowEngine:
                 
                 gc.collect()
                 torch.cuda.empty_cache()
-                
-                # THE SILVER BULLET: Flush the ThreadPoolExecutor's hidden cache
-                # Submitting a dummy task overwrites the thread's previous memory footprint.
                 self.tsdf_executor.submit(lambda: None).result()
             
             # --- PHASE 2: VGGT TRANSFORMER INFERENCE ---
@@ -104,10 +123,6 @@ class StreamingWindowEngine:
             
             # --- SCALE AND POSE ALIGNMENT ---
             if self.is_first_window:
-                # ====================================================================
-                # 🚨 IMPLEMENT YOUR CAMERA HEIGHT SCALE FIX HERE 🚨
-                # The median guess below was causing the arbitrary volume explosions!
-                # ====================================================================
                 first_depth = np.linalg.norm(pts_list[0], axis=-1)
                 valid_depths = first_depth[first_depth > 0.1]
                 if len(valid_depths) > 0:
@@ -169,11 +184,10 @@ class StreamingWindowEngine:
             self.is_first_window = False
 
             # --- PHASE 3: NVBLOX GPU INTEGRATION ---
-            # Dropped voxel_size to 1cm (0.01) to give you extra VRAM buffer while fixing scale
-            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=4.0, device=self.device)
+            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=4.5, device=self.device)
             
             self.tsdf_future = self.tsdf_executor.submit(
-                self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
+                self._async_tsdf_task, self.tsdf, batch_depths, batch_rgbs, batch_masks, batch_poses
             )
             
             self.submap_count += 1
@@ -190,8 +204,23 @@ class StreamingWindowEngine:
         # --- END OF SEQUENCE ---
         if self.tsdf_future is not None:
             local_mesh, local_pcd = self.tsdf_future.result()
+            
+            # Snap final chunk
+            local_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+            if len(self.global_pcd.points) > 0:
+                print("  [CPU] Snapping final chunk via ICP...")
+                icp_result = o3d.pipelines.registration.registration_icp(
+                    local_pcd, self.global_pcd, 
+                    max_correspondence_distance=0.15,
+                    init=np.eye(4),
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane()
+                )
+                local_pcd.transform(icp_result.transformation)
+                local_mesh.transform(icp_result.transformation)
+            
             self.global_pcd += local_pcd
             self.global_mesh += local_mesh
+            self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.015)
             
             del self.tsdf_future
             self.tsdf_future = None
@@ -204,5 +233,5 @@ class StreamingWindowEngine:
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
         self.global_mesh.remove_duplicated_vertices()
         
-        # FIX: Send the global point cloud instead of None so the UI doesn't crash
+        # Yield the fused point cloud instead of None!
         yield self.global_mesh, self.global_pcd, np.array(self.trajectory), []

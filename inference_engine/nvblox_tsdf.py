@@ -69,13 +69,18 @@ class NvbloxPanoTSDF:
         # 1. Prepare explicit PyTorch Mask Tensor
         if mask is not None:
             if isinstance(mask, np.ndarray):
-                # FIX: Add .copy() to bypass PyTorch's read-only memory warning
                 mask = torch.from_numpy(mask.copy()).float().to(self.device)
             else:
                 mask = mask.float()
         else:
             mask = torch.ones_like(pano_depth_map)
             
+        # --- THE EDGE SHAVE FIX ---
+        # Generate a rigid border mask to ignore the highly distorted edges of the projection
+        border_size = int(self.face_size * 0.05) # Shave 5% off the edges
+        face_border_mask = torch.zeros((1, 1, self.face_size, self.face_size), device=self.device)
+        face_border_mask[..., border_size:-border_size, border_size:-border_size] = 1.0
+        
         use_color = pano_rgb is not None
         if use_color and isinstance(pano_rgb, np.ndarray):
             pano_rgb = torch.from_numpy(pano_rgb).float().to(self.device)
@@ -85,20 +90,16 @@ class NvbloxPanoTSDF:
         pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0) if use_color else None
 
         for i in range(6):
-            # 2. NEAREST sampling prevents "ramp" artifacts at the mask edges
-            radial_depth = F.grid_sample(
-                pano_depth_tensor, 
-                self.batched_grids[i:i+1], 
-                mode='nearest', 
-                align_corners=True
-            ).squeeze(0).squeeze(0)
-            
+            # 2. Slice the global mask
             face_mask = F.grid_sample(
                 pano_mask_tensor,
                 self.batched_grids[i:i+1],
                 mode='nearest',
                 align_corners=True
             ).squeeze(0).squeeze(0)
+            
+            # Combine the global valid mask with our new rigid border mask
+            face_mask = face_mask * face_border_mask.squeeze()
             
             optical_depth = radial_depth * self.batched_z_mults[i]
             
