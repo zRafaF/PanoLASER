@@ -4,7 +4,8 @@ import open3d as o3d
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from .nvblox_tsdf import NvbloxPanoTSDF
+# Swap Nvblox out for the new Open3D VBG implementation
+from .open3d_vbg_tsdf import Open3DPanoVBG
 from .inference_utils import align_cam_pts_irls
 from .utils.geometry import register_camera_poses_kabsch
 from .pano_graph import PanoPoseGraph  
@@ -28,7 +29,8 @@ class StreamingWindowEngineLC:
         if self.tsdf_future is not None:
             self.tsdf_future.result()
             
-        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.03, max_depth=4.0, device=self.device)
+        # Initialize VBG with a very tight voxel size (1cm) for building mapping
+        self.tsdf = Open3DPanoVBG(voxel_size_m=0.01, max_depth=5.0, device=self.device)
         self.pose_graph = PanoPoseGraph()
         
         self.prev_overlap_raw_pts = []
@@ -146,7 +148,7 @@ class StreamingWindowEngineLC:
                             best_match_id = old_id
                 
                 if best_score > 0.92: 
-                    print(f"  [SLAM] 🟢 LOOP DETECTED: Submap {self.submap_count} -> {best_match_id} (Score: {best_score:.3f})")
+                    print(f"  [SLAM] 🟢 LOOP DETECTED: Submap {self.submap_count} -> {best_match_id}")
                     old_frame = self.lc_anchor_frames[best_match_id]
                     
                     lc_preds = self.engine(np.stack([old_frame, mid_frame]))
@@ -234,15 +236,15 @@ class StreamingWindowEngineLC:
             trajectory = [self.pose_graph.get_optimized_pose(k)[:3, 3] for k in range(self.submap_count)]
             lc_edges = [(self.pose_graph.get_optimized_pose(f)[:3, 3], self.pose_graph.get_optimized_pose(t)[:3, 3]) for f, t in self.loop_closures]
             
-            # Pass viz_voxel_scale=4.0 to stream a fast, sparse preview (8cm resolution)
-            live_pcd = self.tsdf.extract_point_cloud(surface_threshold=0.02, viz_voxel_scale=4.0)
+            # Stream the dense, undecimated point cloud directly during mapping
+            live_pcd = self.tsdf.extract_point_cloud()
             
             yield None, live_pcd, np.array(trajectory), lc_edges
 
         # --- END OF SEQUENCE: EXPORT MESH ---
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
         
-        # nvblox generates exceptionally clean meshes inherently suited for planar walls
+        # Marching cubes guarantees topologically connected structures for flat walls [cite: 1685]
         final_mesh = self.tsdf.extract_mesh() 
         
         yield final_mesh, None, np.array(trajectory), lc_edges
