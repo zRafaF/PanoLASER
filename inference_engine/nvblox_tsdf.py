@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import open3d as o3d
-import time
 
 from nvblox_torch.mapper import Mapper
 from nvblox_torch.sensor import Sensor
@@ -28,33 +27,23 @@ class NvbloxPanoTSDF:
         self._precompute_cubemap_grids()
 
     def _precompute_cubemap_grids(self):
-        """Mathematically rigorous projection to eliminate all alignment distortions."""
         u = torch.linspace(-1, 1, self.face_size, device=self.device)
         v = torch.linspace(-1, 1, self.face_size, device=self.device)
         v_grid, u_grid = torch.meshgrid(v, u, indexing='ij')
         
-        # 1. Define base rays for a standard pinhole looking +Z, X right, Y down
         base_rays = torch.stack([u_grid, v_grid, torch.ones_like(u_grid)], dim=-1)
         
-        # 2. Strict OpenCV Rotation Matrices for the 6 Cube Faces
         self.face_rotations = [
-            # Front (+Z)
             torch.tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]], device=self.device, dtype=torch.float32),
-            # Right (+X)
             torch.tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], device=self.device, dtype=torch.float32),
-            # Back (-Z)
             torch.tensor([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], device=self.device, dtype=torch.float32),
-            # Left (-X)
             torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]], device=self.device, dtype=torch.float32),
-            # Top (-Y) -> Look -Y, Up +Z
             torch.tensor([[-1, 0, 0], [0, 0, -1], [0, -1, 0]], device=self.device, dtype=torch.float32),
-            # Bottom (+Y) -> Look +Y, Up -Z
             torch.tensor([[-1, 0, 0], [0, 0, 1], [0, 1, 0]], device=self.device, dtype=torch.float32),
         ]
         
         grids = []
         for R in self.face_rotations:
-            # 3. Rotate local rays to global spherical coordinates (Guarantees perfect alignment)
             ray_global = base_rays @ R.T
             X, Y, Z = ray_global[..., 0], ray_global[..., 1], ray_global[..., 2]
             
@@ -67,8 +56,7 @@ class NvbloxPanoTSDF:
             grids.append(torch.stack([u_norm, v_norm], dim=-1))
             
         self.batched_grids = torch.stack(grids, dim=0)
-
-        # Optical depth multiplier (Z / distance) to flatten radial distance
+        
         z_mult = 1.0 / torch.sqrt(u_grid**2 + v_grid**2 + 1.0)
         self.batched_z_mults = z_mult.unsqueeze(0).expand(6, -1, -1)
 
@@ -78,36 +66,50 @@ class NvbloxPanoTSDF:
             pano_depth_map = torch.from_numpy(pano_depth_map).float().to(self.device)
             pose = torch.from_numpy(pose).float().to(self.device)
             
-        # --- CRITICAL MEMORY FIX ---
-        # Apply the mask! Zero out sky and invalid pixels so nvblox doesn't map infinity
+        # 1. Prepare explicit PyTorch Mask Tensor
         if mask is not None:
             if isinstance(mask, np.ndarray):
-                mask = torch.from_numpy(mask).bool().to(self.device)
-            pano_depth_map[~mask] = 0.0
-            
-        pano_depth_map = torch.nan_to_num(pano_depth_map, 0.0)
-        pano_depth_map[pano_depth_map > self.max_depth] = 0.0
+                mask = torch.from_numpy(mask).float().to(self.device)
+            else:
+                mask = mask.float()
+        else:
+            mask = torch.ones_like(pano_depth_map)
             
         use_color = pano_rgb is not None
         if use_color and isinstance(pano_rgb, np.ndarray):
             pano_rgb = torch.from_numpy(pano_rgb).float().to(self.device)
             
         pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0)
+        pano_mask_tensor = mask.unsqueeze(0).unsqueeze(0)
         pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0) if use_color else None
 
         for i in range(6):
+            # 2. NEAREST sampling prevents "ramp" artifacts at the mask edges
             radial_depth = F.grid_sample(
                 pano_depth_tensor, 
                 self.batched_grids[i:i+1], 
-                mode='bilinear', 
+                mode='nearest', 
+                align_corners=True
+            ).squeeze(0).squeeze(0)
+            
+            face_mask = F.grid_sample(
+                pano_mask_tensor,
+                self.batched_grids[i:i+1],
+                mode='nearest',
                 align_corners=True
             ).squeeze(0).squeeze(0)
             
             optical_depth = radial_depth * self.batched_z_mults[i]
-            optical_depth[optical_depth > self.max_depth] = 0.0
+            
+            # 3. STRICT INVALIDATION
+            # nvblox ignores any depth < 0.0. This completely stops fake geometry.
+            optical_depth[face_mask < 0.5] = -1.0
+            optical_depth[optical_depth > self.max_depth] = -1.0
+            optical_depth[optical_depth <= 0.01] = -1.0 
             
             color_face_uint8 = None
             if use_color:
+                # Color can stay bilinear for visual smoothness
                 color_face = F.grid_sample(
                     pano_rgb_tensor, 
                     self.batched_grids[i:i+1], 
@@ -120,7 +122,8 @@ class NvbloxPanoTSDF:
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
             face_pose_cpu = face_pose.cpu()
             
-            del radial_depth, face_pose
+            # Memory clearance before entering C++ backend
+            del radial_depth, face_mask, face_pose
             if use_color:
                 del color_face
             torch.cuda.empty_cache()
@@ -141,7 +144,8 @@ class NvbloxPanoTSDF:
                 
             del optical_depth, face_pose_cpu
 
-        del pano_depth_tensor, pano_depth_map, pose
+        # Final cleanup
+        del pano_depth_tensor, pano_mask_tensor, pano_depth_map, pose, mask
         if use_color:
             del pano_rgb_tensor, pano_rgb
         torch.cuda.empty_cache()
