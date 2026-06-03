@@ -117,13 +117,26 @@ class NvbloxPanoTSDF:
                 face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
                 face_pose_cpu = face_pose.cpu()
                 
-                # 3. Integrate into nvblox
+                # 3. Integrate depth into nvblox
                 self.mapper.add_depth_frame(
-                    optical_depth.contiguous(), 
-                    face_pose_cpu, 
+                    optical_depth.contiguous(),
+                    face_pose_cpu,
                     self.camera
                 )
-                
+
+                # 4. Integrate color into nvblox (this is what populates vertex_colors!)
+                if pano_rgb_tensor is not None:
+                    face_color = F.grid_sample(
+                        pano_rgb_tensor,
+                        self.batched_grids[i:i+1],
+                        mode='bilinear',
+                        align_corners=True
+                    ).squeeze(0)  # (3, H, W)
+                    # nvblox expects (H, W, 3) uint8
+                    face_color_hwc = face_color.permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu()
+                    self.mapper.add_color_frame(face_color_hwc, face_pose_cpu, self.camera)
+                    del face_color, face_color_hwc
+
                 # Cleanup local loop variables
                 del radial_depth, optical_depth, face_pose, face_mask
                 
@@ -139,20 +152,24 @@ class NvbloxPanoTSDF:
         torch.cuda.empty_cache()
 
     def extract_point_cloud(self, surface_threshold=0.02, viz_voxel_scale=4.0):
+        # update_color_mesh called ONCE here; extract_mesh reuses the result
+        # without calling it again, so pcd.colors won't be invalidated.
         self.mapper.update_color_mesh()
         o3d_mesh = self.mapper.get_color_mesh().to_open3d()
-        
+
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d_mesh.vertices
-        pcd.colors = o3d_mesh.vertex_colors
-        
+        # Force numpy copies so pcd owns its data independently of the mesh buffer
+        pcd.points = o3d.utility.Vector3dVector(np.asarray(o3d_mesh.vertices).copy())
+        pcd.colors = o3d.utility.Vector3dVector(np.asarray(o3d_mesh.vertex_colors).copy())
+
         if viz_voxel_scale > 1.0:
             voxel_size = self.voxel_size_m * viz_voxel_scale
             pcd = pcd.voxel_down_sample(voxel_size)
-            
+
         return pcd
 
     def extract_mesh(self):
         print("[TSDF] Generating dense planar mesh from nvblox...")
-        self.mapper.update_color_mesh()
+        # Reuse the mesh already updated by extract_point_cloud —
+        # calling update_color_mesh() again would invalidate the pcd color buffer.
         return self.mapper.get_color_mesh().to_open3d()

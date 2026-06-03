@@ -129,3 +129,37 @@ uv run python demo.py --window_size 20 --overlap 5
 This project started as a spinnoff of the original LASER codebase, adapted to work with panoramic video input.
 
 But during development we also made significant architectural changes to the original pipeline not using the architectural design of LASER, but instead implementing our tsdf and using part of the architectural design of [VGGT-Slam](https://github.com/MIT-SPARK/VGGT-SLAM)
+
+
+# Quick setup runpod
+
+```bash
+git clone --recurse-submodules https://github.com/zRafaF/PanoLASER
+cd PanoLASER
+git checkout slam-nvblox
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+
+uv sync
+mkdir -p checkpoints
+wget https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt -O checkpoints/model.pt
+
+apt-get update && apt-get install -y git-lfs cmake build-essential python3-dev
+git lfs install
+git clone -b v0.0.10 https://github.com/nvidia-isaac/nvblox.git
+cd nvblox
+source /root/PanoLASER/.venv/bin/activate
+
+mkdir build && cd build
+cmake .. -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch.utils; print(torch.utils.cmake_prefix_path)')" -DBUILD_RENDERER=0
+
+make -j$(nproc)
+cd ../nvblox_torch
+uv pip install --editable .
+
+
+
+
+##### PATH
+/root/PanoLASER/examples/resize
+```
