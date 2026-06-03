@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import open3d as o3d
 import time
+import gc  # <-- REQUIRED TO FORCE C++ VRAM DESTRUCTION
 from concurrent.futures import ThreadPoolExecutor
 
 from .nvblox_tsdf import NvbloxPanoTSDF
@@ -25,8 +26,9 @@ class StreamingWindowEngine:
     def reset(self):
         if self.tsdf_future is not None:
             self.tsdf_future.result()
+            del self.tsdf_future
+            self.tsdf_future = None
             
-        # The ultimate map is stored safely in System RAM
         self.global_pcd = o3d.geometry.PointCloud()
         self.global_mesh = o3d.geometry.TriangleMesh()
         
@@ -38,10 +40,11 @@ class StreamingWindowEngine:
         self.is_first_window = True
         self.current_metric_scale = 1.0
         
-        # Ensure GPU is clean on reset
         if self.tsdf is not None:
             del self.tsdf
             self.tsdf = None
+            
+        gc.collect()
         torch.cuda.empty_cache()
 
     def _async_tsdf_task(self, tsdf_instance, depth_maps, rgb_frames, masks, poses):
@@ -50,7 +53,6 @@ class StreamingWindowEngine:
             tsdf_instance.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
         torch.cuda.synchronize()
         
-        # Extract the local chunk immediately to System RAM while on the thread
         local_pcd = tsdf_instance.extract_point_cloud(viz_voxel_scale=4.0)
         local_mesh = tsdf_instance.extract_mesh()
         
@@ -68,29 +70,34 @@ class StreamingWindowEngine:
             
             print(f"\n[Engine] Processing Submap {self.submap_count}...")
             
-            # --- PHASE 1: RECLAIM GPU VRAM FROM PREVIOUS SUBMAP ---
-            # Wait for the last chunk to finish integrating
+            # --- PHASE 1: RECLAIM GPU VRAM ---
             if self.tsdf_future is not None:
                 local_mesh, local_pcd = self.tsdf_future.result()
                 
-                # Append the extracted chunk to the global RAM map
                 self.global_pcd += local_pcd
                 self.global_mesh += local_mesh
                 
-                # WIPE Nvblox from the GPU entirely!
+                # THE MEMORY LEAK FIX:
+                # The Future holds a hard reference to the thread's arguments (the old nvblox).
+                # We MUST delete the Future to release the C++ object!
+                del self.tsdf_future
+                self.tsdf_future = None
+                
+                # Delete the main thread's pointer
                 del self.tsdf
                 self.tsdf = None
+                
+                # Force Python to instantly execute PyBind11's C++ destructors
+                gc.collect()
                 torch.cuda.empty_cache()
             
             # --- PHASE 2: VGGT TRANSFORMER INFERENCE ---
-            # The GPU is now completely empty. 100% VRAM is available for the network.
             t_gpu = time.time()
             with torch.inference_mode():
                 preds = self.engine(window_frames)
             torch.cuda.synchronize()  
             print(f"  [Profile] VGGT Inference: {time.time() - t_gpu:.4f} sec")
 
-            # Move outputs to CPU RAM immediately and flush VRAM
             pts_list = [p.cpu().numpy() if isinstance(p, torch.Tensor) else p for p in preds["points"]]
             poses = [p.cpu().numpy() if isinstance(p, torch.Tensor) else p for p in preds["poses"]]
             del preds 
@@ -159,8 +166,6 @@ class StreamingWindowEngine:
             self.is_first_window = False
 
             # --- PHASE 3: NVBLOX GPU INTEGRATION ---
-            # Spin up a brand new mapper just for this submap. 
-            # It will strictly use the memory for 16 frames and never grow out of control.
             self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=5.0, device=self.device)
             
             self.tsdf_future = self.tsdf_executor.submit(
@@ -171,7 +176,6 @@ class StreamingWindowEngine:
             print(f"  [Profile] Cycle Time: {time.time() - t_win_start:.4f} sec")
             
             # --- GRADIO CRASH FIX ---
-            # Prevent Open3D from failing to write an empty file on the first frame
             safe_pcd = self.global_pcd
             if len(safe_pcd.points) == 0:
                 safe_pcd = o3d.geometry.PointCloud()
@@ -185,13 +189,16 @@ class StreamingWindowEngine:
             local_mesh, local_pcd = self.tsdf_future.result()
             self.global_pcd += local_pcd
             self.global_mesh += local_mesh
+            
+            del self.tsdf_future
+            self.tsdf_future = None
             del self.tsdf
             self.tsdf = None
+            
+            gc.collect()
             torch.cuda.empty_cache()
 
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
-        
-        # Clean up chunk seams before final export
         self.global_mesh.remove_duplicated_vertices()
         
         yield self.global_mesh, None, np.array(self.trajectory), []
