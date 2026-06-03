@@ -170,7 +170,7 @@ class StreamingWindowEngine:
 
             # --- PHASE 3: NVBLOX GPU INTEGRATION ---
             # Dropped voxel_size to 1cm (0.01) to give you extra VRAM buffer while fixing scale
-            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.01, max_depth=2.5, device=self.device)
+            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=4.0, device=self.device)
             
             self.tsdf_future = self.tsdf_executor.submit(
                 self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
