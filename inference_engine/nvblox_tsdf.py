@@ -124,7 +124,7 @@ class NvbloxPanoTSDF:
                     self.camera
                 )
 
-                # 4. Integrate color into nvblox (this is what populates vertex_colors!)
+                # 4. Integrate color into nvblox — must stay on CUDA
                 if pano_rgb_tensor is not None:
                     face_color = F.grid_sample(
                         pano_rgb_tensor,
@@ -132,8 +132,8 @@ class NvbloxPanoTSDF:
                         mode='bilinear',
                         align_corners=True
                     ).squeeze(0)  # (3, H, W)
-                    # nvblox expects (H, W, 3) uint8
-                    face_color_hwc = face_color.permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu()
+                    # nvblox expects (H, W, 3) uint8 on CUDA
+                    face_color_hwc = face_color.permute(1, 2, 0).clamp(0, 255).to(torch.uint8)
                     self.mapper.add_color_frame(face_color_hwc, face_pose_cpu, self.camera)
                     del face_color, face_color_hwc
 
