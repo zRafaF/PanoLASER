@@ -189,7 +189,7 @@ class StreamingWindowEngine:
             self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=4.5, device=self.device)
             
             self.tsdf_future = self.tsdf_executor.submit(
-                self._async_tsdf_task, self.tsdf, batch_depths, batch_rgbs, batch_masks, batch_poses
+                self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
             )
             
             self.submap_count += 1
