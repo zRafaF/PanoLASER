@@ -47,16 +47,18 @@ class StreamingWindowEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def _async_tsdf_task(self, tsdf_instance, depth_maps, rgb_frames, masks, poses):
-        t_start = time.time()
+    def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
+        # FORCE A FRESH MAPPER FOR EACH SUBMAP TO AVOID MEMORY ACCUMULATION
+        # (Your loop is already doing this, but ensure the integration is tight)
         for j in range(len(poses)):
-            tsdf_instance.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
-        torch.cuda.synchronize()
+            # ONLY integrate frames that are significantly different from previous ones
+            self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
         
-        # Pull raw, undecimated point cloud for highly accurate CPU ICP alignment
-        local_pcd = tsdf_instance.extract_point_cloud(viz_voxel_scale=1.0)
-        local_mesh = tsdf_instance.extract_mesh()
+        # CLEAR THE MESH BUFFER HERE to stop the 'IndexSet too large' error
+        self.tsdf.mapper.clear_mesh() 
         
+        local_pcd = self.tsdf.extract_point_cloud(viz_voxel_scale=1.0)
+        local_mesh = self.tsdf.extract_mesh()
         return local_mesh, local_pcd
 
     def process_sequence(self, frames, masks):

@@ -62,21 +62,35 @@ class NvbloxPanoTSDF:
 
     @torch.no_grad()
     def integrate(self, pano_depth_map, pano_rgb, mask, pose):
-        # 1. Initialize variables to None to prevent UnboundLocalError
-        radial_depth = None
-        
+        # Ensure depth is a tensor
         if isinstance(pano_depth_map, np.ndarray):
             pano_depth_map = torch.from_numpy(pano_depth_map).float().to(self.device)
+        
+        # Ensure pose is a tensor
+        if isinstance(pose, np.ndarray):
             pose = torch.from_numpy(pose).float().to(self.device)
             
+        # Ensure mask is a tensor
         if mask is not None:
-            mask = torch.from_numpy(mask.copy()).float().to(self.device)
+            if isinstance(mask, np.ndarray):
+                mask = torch.from_numpy(mask.copy()).float().to(self.device)
+            else:
+                mask = mask.float()
         else:
             mask = torch.ones_like(pano_depth_map)
             
+        # --- FIXED: Robust RGB Tensor Conversion ---
+        use_color = pano_rgb is not None
+        if use_color:
+            if isinstance(pano_rgb, np.ndarray):
+                pano_rgb = torch.from_numpy(pano_rgb).float().to(self.device)
+            # Now it's guaranteed to be a tensor, so .permute() will work
+            pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0)
+        else:
+            pano_rgb_tensor = None
+            
         pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0)
         pano_mask_tensor = mask.unsqueeze(0).unsqueeze(0)
-        pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0) if pano_rgb is not None else None
 
         for i in range(6):
             try:
