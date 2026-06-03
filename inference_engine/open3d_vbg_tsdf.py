@@ -5,10 +5,16 @@ import open3d as o3d
 import numpy as np
 
 class Open3DPanoVBG:
-    def __init__(self, voxel_size_m=0.01, max_depth=6.0, face_size=512, device="cuda:0"):
-        # Ensure device string is compatible with Open3D Core
+    def __init__(self, voxel_size_m=0.01, max_depth=6.0, face_size=512, device="cuda"):
+        # 1. PyTorch handles "cuda" or "cuda:0" just fine
         self.torch_device = torch.device(device)
-        self.o3d_device = o3d.core.Device(device.upper())
+        
+        # 2. Open3D strictly requires the device index (e.g., "CUDA:0")
+        o3d_dev_str = device.upper()
+        if ":" not in o3d_dev_str:
+            o3d_dev_str += ":0"
+            
+        self.o3d_device = o3d.core.Device(o3d_dev_str)
         
         self.voxel_size_m = voxel_size_m
         self.max_depth = max_depth
@@ -16,7 +22,7 @@ class Open3DPanoVBG:
         
         print(f"[TSDF] Initializing GPU Open3D VoxelBlockGrid (Voxel Size: {voxel_size_m}m)...")
         
-        # Initialize the sparse Voxel Block Grid [cite: 1658]
+        # Initialize the sparse Voxel Block Grid
         self.vbg = o3d.t.geometry.VoxelBlockGrid(
             attr_names=['tsdf', 'weight', 'color'],
             attr_dtypes=[o3d.core.float32, o3d.core.float32, o3d.core.float32],
@@ -27,6 +33,7 @@ class Open3DPanoVBG:
             device=self.o3d_device
         )
         
+        # ... (keep the rest of the __init__ exactly the same) ...
         # Intrinsics for a 90-degree FOV pinhole camera (Cubemap face)
         f = self.face_size / 2.0
         c = self.face_size / 2.0
