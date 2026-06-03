@@ -4,8 +4,8 @@ import open3d as o3d
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-# Swap Nvblox out for the new Open3D VBG implementation
-from .open3d_vbg_tsdf import Open3DPanoVBG
+# Revert to Nvblox TSDF Engine
+from .nvblox_tsdf import NvbloxPanoTSDF
 from .inference_utils import align_cam_pts_irls
 from .utils.geometry import register_camera_poses_kabsch
 from .pano_graph import PanoPoseGraph  
@@ -29,8 +29,8 @@ class StreamingWindowEngineLC:
         if self.tsdf_future is not None:
             self.tsdf_future.result()
             
-        # Initialize VBG with a very tight voxel size (1cm) for building mapping
-        self.tsdf = Open3DPanoVBG(voxel_size_m=0.01, max_depth=5.0, device=self.device)
+        # Revert to Nvblox with a high density 1.5cm resolution
+        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=5.0, device=self.device)
         self.pose_graph = PanoPoseGraph()
         
         self.prev_overlap_raw_pts = []
@@ -88,7 +88,7 @@ class StreamingWindowEngineLC:
             torch.cuda.synchronize()  
             print(f"  [Profile] VGGT Inference: {time.time() - t_gpu:.4f} sec")
 
-            # Extricate data from the PyTorch graph and delete it IMMEDIATELY
+            # Retain strict memory extrication to prevent OOM
             pts_list = [p.cpu().numpy() if isinstance(p, torch.Tensor) else p for p in preds["points"]]
             poses = [p.cpu().numpy() if isinstance(p, torch.Tensor) else p for p in preds["poses"]]
             del preds 
@@ -97,7 +97,6 @@ class StreamingWindowEngineLC:
             mid_idx = self.window_size // 2
             mid_frame = window_frames[mid_idx]
             
-            # FIX: Explicitly cast the embedding to CPU to prevent a dictionary memory leak
             current_emb = self.retriever.get_single_embeding(mid_frame).cpu()
             
             self.lc_embeddings[self.submap_count] = current_emb
@@ -209,6 +208,7 @@ class StreamingWindowEngineLC:
                 global_pose = optimized_anchor @ canonical_poses[j]
                 
                 tsdf_pose = global_pose.copy()
+                # Maintain the Y/Z axis flip to keep the orientation sound for nvblox
                 if tsdf_pose[1, 1] < 0:
                     flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
                     tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ flip_R
@@ -237,25 +237,20 @@ class StreamingWindowEngineLC:
             self.submap_count += 1
             print(f"  [Profile] Cycle Time: {time.time() - t_win_start:.4f} sec")
 
-            # --- GPU STREAM YIELD ---
             if self.tsdf_future is not None:
                 self.tsdf_future.result()
 
-            # CLEAR CACHE BEFORE EXTRACTING THE HEAVY POINT CLOUD
             torch.cuda.empty_cache()
 
             trajectory = [self.pose_graph.get_optimized_pose(k)[:3, 3] for k in range(self.submap_count)]
             lc_edges = [(self.pose_graph.get_optimized_pose(f)[:3, 3], self.pose_graph.get_optimized_pose(t)[:3, 3]) for f, t in self.loop_closures]
             
-            # Stream the dense, undecimated point cloud directly during mapping
-            live_pcd = self.tsdf.extract_point_cloud()
+            # Use viz_voxel_scale=4.0 for a fast, sparse live preview
+            live_pcd = self.tsdf.extract_point_cloud(viz_voxel_scale=4.0)
             
             yield None, live_pcd, np.array(trajectory), lc_edges
 
-        # --- END OF SEQUENCE: EXPORT MESH ---
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
-        
-        # Marching cubes guarantees topologically connected structures for flat walls [cite: 1685]
         final_mesh = self.tsdf.extract_mesh() 
         
         yield final_mesh, None, np.array(trajectory), lc_edges
