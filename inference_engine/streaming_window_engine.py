@@ -204,4 +204,5 @@ class StreamingWindowEngine:
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
         self.global_mesh.remove_duplicated_vertices()
         
-        yield self.global_mesh, None, np.array(self.trajectory), []
+        # FIX: Send the global point cloud instead of None so the UI doesn't crash
+        yield self.global_mesh, self.global_pcd, np.array(self.trajectory), []
