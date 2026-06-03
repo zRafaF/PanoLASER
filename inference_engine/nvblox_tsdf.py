@@ -69,7 +69,8 @@ class NvbloxPanoTSDF:
         # 1. Prepare explicit PyTorch Mask Tensor
         if mask is not None:
             if isinstance(mask, np.ndarray):
-                mask = torch.from_numpy(mask).float().to(self.device)
+                # FIX: Add .copy() to bypass PyTorch's read-only memory warning
+                mask = torch.from_numpy(mask.copy()).float().to(self.device)
             else:
                 mask = mask.float()
         else:

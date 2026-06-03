@@ -170,8 +170,15 @@ class StreamingWindowEngine:
             self.submap_count += 1
             print(f"  [Profile] Cycle Time: {time.time() - t_win_start:.4f} sec")
             
-            # Stream the accumulated global RAM point cloud to the viewer
-            yield None, self.global_pcd, np.array(self.trajectory), []
+            # --- GRADIO CRASH FIX ---
+            # Prevent Open3D from failing to write an empty file on the first frame
+            safe_pcd = self.global_pcd
+            if len(safe_pcd.points) == 0:
+                safe_pcd = o3d.geometry.PointCloud()
+                safe_pcd.points = o3d.utility.Vector3dVector([[0.0, 0.0, 0.0]])
+                safe_pcd.colors = o3d.utility.Vector3dVector([[0.0, 0.0, 0.0]])
+                
+            yield None, safe_pcd, np.array(self.trajectory), []
 
         # --- END OF SEQUENCE ---
         if self.tsdf_future is not None:
