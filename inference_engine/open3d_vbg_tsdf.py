@@ -27,7 +27,7 @@ class Open3DPanoVBG:
             attr_channels=[[1], [1], [3]],
             voxel_size=self.voxel_size_m,
             block_resolution=16,
-            block_count=18000, # Reduced to guarantee PyTorch has breathing room
+            block_count=12000, # Dropped to 12k to guarantee absolute VRAM safety
             device=self.o3d_device
         )
         
@@ -77,8 +77,6 @@ class Open3DPanoVBG:
             v_norm = phi / (torch.pi / 2.0)
             grids.append(torch.stack([u_norm, v_norm], dim=-1))
             
-        # BUG FIX: Optical depth multiplier is independent of the sphere axis.
-        # It's purely based on the pinhole ray projection!
         z_mult = 1.0 / torch.sqrt(u_grid**2 + v_grid**2 + 1.0)
         self.batched_z_mults = z_mult.unsqueeze(0).expand(6, -1, -1)
         self.batched_grids = torch.stack(grids, dim=0)
@@ -93,37 +91,60 @@ class Open3DPanoVBG:
         if use_color and isinstance(pano_rgb, np.ndarray):
             pano_rgb = torch.from_numpy(pano_rgb).float().to(self.torch_device)
 
-        pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0).expand(6, -1, -1, -1)
-        radial_depths = F.grid_sample(pano_depth_tensor, self.batched_grids, mode='bilinear', align_corners=True).squeeze(1)
-        
-        optical_depths = radial_depths * self.batched_z_mults
-        optical_depths[optical_depths > self.max_depth] = 0.0
-        
-        color_faces = None
-        if use_color:
-            pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0).expand(6, -1, -1, -1)
-            color_faces = F.grid_sample(pano_rgb_tensor, self.batched_grids, mode='bilinear', align_corners=True)
-            color_faces = color_faces.permute(0, 2, 3, 1) / 255.0
+        pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0)
+        pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0) if use_color else None
 
         for i in range(6):
+            # A. Process ONLY ONE face at a time to prevent PyTorch VRAM spikes
+            radial_depth = F.grid_sample(
+                pano_depth_tensor, 
+                self.batched_grids[i:i+1], 
+                mode='bilinear', 
+                align_corners=True
+            ).squeeze(0).squeeze(0)
+            
+            optical_depth = radial_depth * self.batched_z_mults[i]
+            optical_depth[optical_depth > self.max_depth] = 0.0
+            
+            color_face = None
+            if use_color:
+                color_face = F.grid_sample(
+                    pano_rgb_tensor, 
+                    self.batched_grids[i:i+1], 
+                    mode='bilinear', 
+                    align_corners=True
+                ).squeeze(0)
+                color_face = color_face.permute(1, 2, 0) / 255.0
+
+            # B. Convert to Open3D via DLPack
             face_pose = pose.clone()
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
             
             extrinsic_np = torch.linalg.inv(face_pose).cpu().numpy()
             extrinsic_o3d = o3d.core.Tensor(extrinsic_np, o3d.core.float64, self.cpu_device)
             
-            depth_dl = torch.utils.dlpack.to_dlpack(optical_depths[i].contiguous())
+            depth_dl = torch.utils.dlpack.to_dlpack(optical_depth.contiguous())
             depth_o3d = o3d.t.geometry.Image(o3d.core.Tensor.from_dlpack(depth_dl))
             
             color_o3d = None
             if use_color:
-                color_dl = torch.utils.dlpack.to_dlpack(color_faces[i].contiguous())
+                color_dl = torch.utils.dlpack.to_dlpack(color_face.contiguous())
                 color_o3d = o3d.t.geometry.Image(o3d.core.Tensor.from_dlpack(color_dl))
                 
             block_coords = self.vbg.compute_unique_block_coordinates(
                 depth_o3d, self.intrinsic_o3d, extrinsic_o3d, depth_scale=1.0, depth_max=self.max_depth
             )
+
+            # C. FORCE PYTORCH TO YIELD MEMORY BEFORE OPEN3D INTEGRATES
+            # Delete intermediate variables
+            del radial_depth, optical_depth, face_pose, depth_dl
+            if use_color:
+                del color_face, color_dl
+                
+            # The Silver Bullet: Yield unused cached memory back to OS for Open3D's C++ allocator
+            torch.cuda.empty_cache() 
                         
+            # D. Open3D Integration (Now has guaranteed memory overhead)
             self.vbg.integrate(
                 block_coords=block_coords,
                 depth=depth_o3d,
@@ -134,12 +155,14 @@ class Open3DPanoVBG:
                 depth_scale=1.0,
                 depth_max=self.max_depth
             )
+            
+            # E. Clean Open3D variables for the next loop iteration
+            del depth_o3d, color_o3d, block_coords
 
-        # --- AGGRESSIVE MEMORY CLEANUP ---
-        # Frees the background thread tensors so PyTorch can safely reuse VRAM
-        del pano_depth_tensor, radial_depths, optical_depths
+        # Final cleanup
+        del pano_depth_tensor, pano_depth_map, pose
         if use_color:
-            del color_faces, pano_rgb_tensor
+            del pano_rgb_tensor, pano_rgb
         torch.cuda.empty_cache()
 
     def extract_point_cloud(self):

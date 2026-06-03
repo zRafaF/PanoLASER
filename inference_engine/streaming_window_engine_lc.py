@@ -241,6 +241,9 @@ class StreamingWindowEngineLC:
             if self.tsdf_future is not None:
                 self.tsdf_future.result()
 
+            # CLEAR CACHE BEFORE EXTRACTING THE HEAVY POINT CLOUD
+            torch.cuda.empty_cache()
+
             trajectory = [self.pose_graph.get_optimized_pose(k)[:3, 3] for k in range(self.submap_count)]
             lc_edges = [(self.pose_graph.get_optimized_pose(f)[:3, 3], self.pose_graph.get_optimized_pose(t)[:3, 3]) for f, t in self.loop_closures]
             
