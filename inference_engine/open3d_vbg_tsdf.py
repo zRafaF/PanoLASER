@@ -1,33 +1,30 @@
 import torch
 import torch.nn.functional as F
-import torch.utils.dlpack
 import open3d as o3d
 import numpy as np
 
 class Open3DPanoVBG:
     def __init__(self, voxel_size_m=0.01, max_depth=6.0, face_size=512, device="cuda"):
+        # Keep PyTorch on the GPU for fast slicing
         self.torch_device = torch.device(device)
         
-        o3d_dev_str = device.upper()
-        if ":" not in o3d_dev_str:
-            o3d_dev_str += ":0"
-            
-        self.o3d_device = o3d.core.Device(o3d_dev_str)
+        # STRATEGIC PIVOT: Force Open3D entirely onto the CPU/System RAM
+        print("[TSDF] Offloading Open3D VoxelBlockGrid to CPU RAM to preserve VRAM...")
+        self.o3d_device = o3d.core.Device("CPU:0") 
         self.cpu_device = o3d.core.Device("CPU:0") 
         
         self.voxel_size_m = voxel_size_m
         self.max_depth = max_depth
         self.face_size = face_size
         
-        print(f"[TSDF] Initializing GPU Open3D VoxelBlockGrid (Voxel Size: {voxel_size_m}m)...")
-        
+        # Because we are using System RAM, we can afford a massive block pool
         self.vbg = o3d.t.geometry.VoxelBlockGrid(
             attr_names=['tsdf', 'weight', 'color'],
             attr_dtypes=[o3d.core.float32, o3d.core.float32, o3d.core.float32],
             attr_channels=[[1], [1], [3]],
             voxel_size=self.voxel_size_m,
             block_resolution=16,
-            block_count=12000, # Dropped to 12k to guarantee absolute VRAM safety
+            block_count=50000, # Massive map capacity, 0 bytes of VRAM used
             device=self.o3d_device
         )
         
@@ -95,7 +92,7 @@ class Open3DPanoVBG:
         pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0) if use_color else None
 
         for i in range(6):
-            # A. Process ONLY ONE face at a time to prevent PyTorch VRAM spikes
+            # 1. Slice extremely fast on the GPU
             radial_depth = F.grid_sample(
                 pano_depth_tensor, 
                 self.batched_grids[i:i+1], 
@@ -116,35 +113,31 @@ class Open3DPanoVBG:
                 ).squeeze(0)
                 color_face = color_face.permute(1, 2, 0) / 255.0
 
-            # B. Convert to Open3D via DLPack
+            # 2. Map Pose to CPU
             face_pose = pose.clone()
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
-            
             extrinsic_np = torch.linalg.inv(face_pose).cpu().numpy()
             extrinsic_o3d = o3d.core.Tensor(extrinsic_np, o3d.core.float64, self.cpu_device)
             
-            depth_dl = torch.utils.dlpack.to_dlpack(optical_depth.contiguous())
-            depth_o3d = o3d.t.geometry.Image(o3d.core.Tensor.from_dlpack(depth_dl))
+            # 3. Pull Tensors to CPU System RAM via numpy
+            depth_np = optical_depth.cpu().numpy()
+            depth_o3d = o3d.t.geometry.Image(o3d.core.Tensor(depth_np, o3d.core.float32, self.cpu_device))
             
             color_o3d = None
             if use_color:
-                color_dl = torch.utils.dlpack.to_dlpack(color_face.contiguous())
-                color_o3d = o3d.t.geometry.Image(o3d.core.Tensor.from_dlpack(color_dl))
+                color_np = color_face.cpu().numpy()
+                color_o3d = o3d.t.geometry.Image(o3d.core.Tensor(color_np, o3d.core.float32, self.cpu_device))
                 
             block_coords = self.vbg.compute_unique_block_coordinates(
                 depth_o3d, self.intrinsic_o3d, extrinsic_o3d, depth_scale=1.0, depth_max=self.max_depth
             )
 
-            # C. FORCE PYTORCH TO YIELD MEMORY BEFORE OPEN3D INTEGRATES
-            # Delete intermediate variables
-            del radial_depth, optical_depth, face_pose, depth_dl
+            # 4. Immediate GPU Memory Release
+            del radial_depth, optical_depth, face_pose
             if use_color:
-                del color_face, color_dl
-                
-            # The Silver Bullet: Yield unused cached memory back to OS for Open3D's C++ allocator
-            torch.cuda.empty_cache() 
+                del color_face
                         
-            # D. Open3D Integration (Now has guaranteed memory overhead)
+            # 5. Integrate cleanly on the CPU (Zero VRAM impact)
             self.vbg.integrate(
                 block_coords=block_coords,
                 depth=depth_o3d,
@@ -156,19 +149,15 @@ class Open3DPanoVBG:
                 depth_max=self.max_depth
             )
             
-            # E. Clean Open3D variables for the next loop iteration
-            del depth_o3d, color_o3d, block_coords
-
-        # Final cleanup
         del pano_depth_tensor, pano_depth_map, pose
         if use_color:
             del pano_rgb_tensor, pano_rgb
-        torch.cuda.empty_cache()
 
     def extract_point_cloud(self):
+        # Extraction happens on CPU, seamlessly passed to the Gradio server
         return self.vbg.extract_point_cloud(weight_threshold=3.0).to_legacy()
 
     def extract_mesh(self):
-        print("[TSDF] Extracting high-density mesh...")
+        print("[TSDF] Extracting high-density mesh on CPU...")
         t_mesh = self.vbg.extract_triangle_mesh(weight_threshold=3.0)
         return t_mesh.to_legacy()
