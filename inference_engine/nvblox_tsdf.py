@@ -7,14 +7,14 @@ from nvblox_torch.mapper import Mapper
 from nvblox_torch.sensor import Sensor
 
 class NvbloxPanoTSDF:
-    def __init__(self, voxel_size_m=0.015, max_depth=4.5, face_size=512, crop_margin=24, device="cuda"):
+    def __init__(self, voxel_size_m=0.01, max_depth=4.5, face_size=512, crop_margin=24, device="cuda"):
         self.device = torch.device(device)
         self.voxel_size_m = voxel_size_m
         self.max_depth = max_depth
         self.face_size = face_size
         self.crop_margin = crop_margin
         
-        print(f"[TSDF] Initializing 6-Face GPU Mapper (Nadir Mask Active)...")
+        print(f"[TSDF] Initializing 6-Face GPU Mapper (Tight 8cm Anti-Fuzz Mask)...")
         self.mapper = Mapper(voxel_sizes_m=self.voxel_size_m)
         
         f = self.face_size / 2.0
@@ -74,6 +74,18 @@ class NvbloxPanoTSDF:
         else:
             mask = torch.ones_like(pano_depth_map)
             
+        # =========================================================
+        # THE PLAQUE FIX: Tightened 8cm Spatial Gradient Mask
+        # Slices away the blurry borders around close-quarter objects
+        # =========================================================
+        depth_shifted_x = torch.cat([pano_depth_map[:, 1:], pano_depth_map[:, -1:]], dim=1)
+        depth_shifted_y = torch.cat([pano_depth_map[1:, :], pano_depth_map[-1:, :]], dim=0)
+        diff_x = torch.abs(pano_depth_map - depth_shifted_x)
+        diff_y = torch.abs(pano_depth_map - depth_shifted_y)
+        
+        edge_mask = (diff_x < 0.08) & (diff_y < 0.08)
+        mask = mask * edge_mask.float()
+        
         use_color = pano_rgb is not None
         if use_color:
             if isinstance(pano_rgb, np.ndarray):
@@ -95,7 +107,7 @@ class NvbloxPanoTSDF:
                     pano_mask_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=True
                 ).squeeze(0).squeeze(0)
                 
-                # Bottom face: apply circular nadir mask to hide the tripod/robot base
+                # Bottom face circular tripod mask
                 if i == 5:
                     u_coords = self.batched_grids[i, :, :, 0]
                     v_coords = self.batched_grids[i, :, :, 1]
@@ -125,7 +137,6 @@ class NvbloxPanoTSDF:
                 face_pose_cpu = face_pose.cpu()
                 
                 self.mapper.add_depth_frame(optical_depth, face_pose_cpu, self.camera)
-                
                 if use_color:
                     self.mapper.add_color_frame(color_face_uint8, face_pose_cpu, self.camera)
                     del color_face_uint8

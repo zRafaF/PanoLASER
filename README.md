@@ -136,7 +136,7 @@ But during development we also made significant architectural changes to the ori
 ```bash
 git clone --recurse-submodules https://github.com/zRafaF/PanoLASER
 cd PanoLASER
-git checkout slam-nvblox
+git checkout slam-2-nvblox
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
 
