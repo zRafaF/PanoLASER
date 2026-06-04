@@ -6,7 +6,15 @@ def estimate_metric_scale_from_floor(local_pts, target_camera_height=1.7, normal
     Finds the floor plane in the local camera point cloud and calculates the absolute metric scale.
     Assumes an OpenCV camera coordinate system (Y is DOWN).
     """
-    # 1. Isolate the lower hemisphere (Y > 0 in OpenCV space)
+    # 1. Flatten the point cloud to (N, 3) in case it comes directly from the (H, W, 3) image output
+    local_pts = local_pts.reshape(-1, 3)
+    
+    # 2. Drop the "Hole": Filter out the [0, 0, 0] points caused by the nadir mask 
+    # so they don't skew the RANSAC calculation
+    valid_mask = np.linalg.norm(local_pts, axis=-1) > 0.1
+    local_pts = local_pts[valid_mask]
+    
+    # 3. Isolate the lower hemisphere (Y > 0.1 in OpenCV space)
     lower_pts = local_pts[local_pts[:, 1] > 0.1]
     
     if len(lower_pts) < 100:
@@ -15,8 +23,8 @@ def estimate_metric_scale_from_floor(local_pts, target_camera_height=1.7, normal
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(lower_pts)
     
-    # 2. RANSAC Plane Fitting
-    # Tries to find a massive flat surface among the points
+    # 4. RANSAC Plane Fitting
+    # This will easily span across any masked "holes" directly beneath the camera.
     try:
         plane_model, inliers = pcd.segment_plane(distance_threshold=0.05,
                                                  ransac_n=3,
@@ -26,7 +34,7 @@ def estimate_metric_scale_from_floor(local_pts, target_camera_height=1.7, normal
         
     [a, b, c, d] = plane_model
     
-    # 3. Check if the plane is horizontal (Normal aligned with Y-axis)
+    # 5. Check if the plane is horizontal (Normal aligned with Y-axis)
     normal = np.array([a, b, c])
     normal = normal / np.linalg.norm(normal)
     
@@ -34,7 +42,7 @@ def estimate_metric_scale_from_floor(local_pts, target_camera_height=1.7, normal
     dot_product = np.clip(np.abs(np.dot(normal, y_axis)), 0.0, 1.0)
     angle = np.degrees(np.arccos(dot_product))
     
-    # 4. Calculate Confidence (Percentage of lower points belonging to the floor)
+    # 6. Calculate Confidence (Percentage of lower points belonging to the floor)
     confidence = len(inliers) / float(len(lower_pts))
     
     if angle <= normal_tolerance_deg and confidence >= inlier_threshold:
@@ -46,5 +54,5 @@ def estimate_metric_scale_from_floor(local_pts, target_camera_height=1.7, normal
         scale_factor = target_camera_height / estimated_height
         return scale_factor, confidence
     else:
-        # Not a flat horizontal floor (e.g., stairs, clutter)
+        # Not a flat horizontal floor (e.g., stairs, clutter, or walking outside on uneven terrain)
         return None, confidence
