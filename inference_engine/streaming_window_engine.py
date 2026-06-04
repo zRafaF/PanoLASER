@@ -23,7 +23,7 @@ class StreamingWindowEngine:
         self.tsdf_future = None
         self.tsdf = None
         
-        print("[Engine] Initializing 1.5cm Chunked Engine with Conservative Outlier Removal...")
+        print("[Engine] Initializing Fast O(1) Engine with Grey Halo Amputation...")
         self.reset()
         
     def reset(self):
@@ -57,18 +57,39 @@ class StreamingWindowEngine:
         
         local_mesh = tsdf_instance.extract_mesh()
         
+        # =========================================================
+        # THE GREY EDGE AMPUTATION
+        # nvblox uninitialized color defaults to exactly 127/255.0.
+        # We find these vertices and surgically remove them and their triangles.
+        # =========================================================
+        if local_mesh.has_vertex_colors():
+            colors = np.asarray(local_mesh.vertex_colors)
+            grey_val = 127 / 255.0
+            
+            # Find vertices that are perfectly nvblox grey (within float precision)
+            is_grey = (np.abs(colors[:, 0] - grey_val) < 1e-3) & \
+                      (np.abs(colors[:, 1] - grey_val) < 1e-3) & \
+                      (np.abs(colors[:, 2] - grey_val) < 1e-3)
+            
+            grey_indices = np.where(is_grey)[0]
+            if len(grey_indices) > 0:
+                local_mesh.remove_vertices_by_index(grey_indices)
+                
+        # Now safely build the point cloud from the cleaned mesh
         local_pcd = o3d.geometry.PointCloud()
         local_pcd.points = local_mesh.vertices
         if local_mesh.has_vertex_colors():
             local_pcd.colors = local_mesh.vertex_colors
             
         # =========================================================
-        # THE GHOST POINT FIX: Conservative Statistical Outlier Removal
-        # Checks if a point has 40 neighbors within a tight standard deviation. 
-        # If not, it is classified as a floating ghost artifact and deleted.
+        # FAST LOCAL DOWNSAMPLING (O(1) Scaling Fix)
+        # Downsample the chunks *before* they enter the global map.
         # =========================================================
-        if len(local_pcd.points) > 50:
-            local_pcd, _ = local_pcd.remove_statistical_outlier(nb_neighbors=40, std_ratio=2.0)
+        if len(local_pcd.points) > 0:
+            local_pcd = local_pcd.voxel_down_sample(voxel_size=0.015)
+            local_mesh = local_mesh.simplify_vertex_clustering(
+                voxel_size=0.015, contraction=o3d.geometry.SimplificationContraction.Average
+            )
             
         return local_mesh, local_pcd
 
@@ -91,13 +112,9 @@ class StreamingWindowEngine:
             if self.tsdf_future is not None:
                 local_mesh, local_pcd = self.tsdf_future.result()
                 
+                # Instantly append the pre-optimized chunks! O(1) performance restored!
                 self.global_pcd += local_pcd
                 self.global_mesh += local_mesh
-                
-                self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.015)
-                self.global_mesh = self.global_mesh.simplify_vertex_clustering(
-                    voxel_size=0.015, contraction=o3d.geometry.SimplificationContraction.Average
-                )
                 
                 del self.tsdf_future, self.tsdf
                 self.tsdf_future = None
@@ -215,15 +232,11 @@ class StreamingWindowEngine:
                 
             yield safe_mesh, safe_pcd, np.array(self.trajectory), []
 
+        # --- END OF SEQUENCE ---
         if self.tsdf_future is not None:
             local_mesh, local_pcd = self.tsdf_future.result()
             self.global_pcd += local_pcd
             self.global_mesh += local_mesh
-            
-            self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.015)
-            self.global_mesh = self.global_mesh.simplify_vertex_clustering(
-                voxel_size=0.015, contraction=o3d.geometry.SimplificationContraction.Average
-            )
             
             del self.tsdf_future, self.tsdf
             gc.collect()

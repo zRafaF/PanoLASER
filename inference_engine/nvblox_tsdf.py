@@ -14,7 +14,7 @@ class NvbloxPanoTSDF:
         self.face_size = face_size
         self.crop_margin = crop_margin
         
-        print(f"[TSDF] Initializing 6-Face GPU Mapper with Edge & Nadir Anti-Bleed...")
+        print(f"[TSDF] Initializing 6-Face GPU Mapper (Nadir Mask Active)...")
         self.mapper = Mapper(voxel_sizes_m=self.voxel_size_m)
         
         f = self.face_size / 2.0
@@ -36,12 +36,12 @@ class NvbloxPanoTSDF:
         base_rays = torch.stack([u_grid, v_grid, torch.ones_like(u_grid)], dim=-1)
         
         self.face_rotations = [
-            torch.tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]], device=self.device, dtype=torch.float32), # Front
-            torch.tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], device=self.device, dtype=torch.float32), # Right
-            torch.tensor([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], device=self.device, dtype=torch.float32), # Back
-            torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]], device=self.device, dtype=torch.float32), # Left
-            torch.tensor([[-1, 0, 0], [0, 0, -1], [0, -1, 0]], device=self.device, dtype=torch.float32), # Top
-            torch.tensor([[-1, 0, 0], [0, 0, 1], [0, 1, 0]], device=self.device, dtype=torch.float32), # Bottom
+            torch.tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]], device=self.device, dtype=torch.float32), 
+            torch.tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], device=self.device, dtype=torch.float32),
+            torch.tensor([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], device=self.device, dtype=torch.float32),
+            torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]], device=self.device, dtype=torch.float32),
+            torch.tensor([[-1, 0, 0], [0, 0, -1], [0, -1, 0]], device=self.device, dtype=torch.float32),
+            torch.tensor([[-1, 0, 0], [0, 0, 1], [0, 1, 0]], device=self.device, dtype=torch.float32),
         ]
         
         grids = []
@@ -74,20 +74,6 @@ class NvbloxPanoTSDF:
         else:
             mask = torch.ones_like(pano_depth_map)
             
-        # =========================================================
-        # THE IMPRINTING FIX: Depth Spatial Gradient Masking
-        # Detect silhouettes (depth jumps > 25cm) and mask them out
-        # This completely stops objects from painting their colors on the floor!
-        # =========================================================
-        depth_shifted_x = torch.cat([pano_depth_map[:, 1:], pano_depth_map[:, -1:]], dim=1)
-        depth_shifted_y = torch.cat([pano_depth_map[1:, :], pano_depth_map[-1:, :]], dim=0)
-        diff_x = torch.abs(pano_depth_map - depth_shifted_x)
-        diff_y = torch.abs(pano_depth_map - depth_shifted_y)
-        
-        edge_mask = (diff_x < 0.25) & (diff_y < 0.25)
-        mask = mask * edge_mask.float()
-        # =========================================================
-            
         use_color = pano_rgb is not None
         if use_color:
             if isinstance(pano_rgb, np.ndarray):
@@ -109,11 +95,7 @@ class NvbloxPanoTSDF:
                     pano_mask_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=True
                 ).squeeze(0).squeeze(0)
                 
-                # =========================================================
-                # THE NADIR FIX: Circular Tripod Mask
-                # Ignore the central 35% of the bottom camera to hide the tripod,
-                # while keeping the outer edges to smoothly map the floor.
-                # =========================================================
+                # Bottom face: apply circular nadir mask to hide the tripod/robot base
                 if i == 5:
                     u_coords = self.batched_grids[i, :, :, 0]
                     v_coords = self.batched_grids[i, :, :, 1]
@@ -157,7 +139,6 @@ class NvbloxPanoTSDF:
                 else:
                     raise e
 
-        # FLUSH QUEUE: Prevents the color block tracking queue from overflowing and defaulting to gray
         if use_color:
             self.mapper.update_color_mesh()
 
