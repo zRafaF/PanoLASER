@@ -94,6 +94,9 @@ class StreamingWindowEngine:
         for i in range(0, num_frames - self.window_size + 1, self.window_size - self.overlap):
             t_win_start = time.time()
             profiler = {}
+
+            window_frames = frames[i : i + self.window_size]
+            window_masks = masks[i : i + self.window_size]
             
             print(f"\n==========================================")
             print(f"[Engine] Processing Submap {self.submap_count}...")
