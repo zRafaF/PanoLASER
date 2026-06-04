@@ -7,6 +7,9 @@ from .tsdf_volume import FastStaticTSDF
 from .inference_utils import align_cam_pts_irls
 from .utils.geometry import register_camera_poses_kabsch
 
+# Import our new metric logic
+from .metricfication import estimate_metric_scale_from_floor
+
 class StreamingWindowEngine:
     def __init__(self, vanilla_engine, window_size=16, overlap=2, device="cuda"):
         self.engine = vanilla_engine
@@ -14,11 +17,13 @@ class StreamingWindowEngine:
         self.overlap = overlap
         self.device = device
         
-        print("[Engine] Initializing Pure PyTorch Streaming Odometry Engine...")
+        # You can eventually make this a dynamic input variable from the UI
+        self.target_camera_height = 1.7 
+        
+        print("[Engine] Initializing PyTorch Engine with Dynamic Metricfication...")
         self.reset()
         
     def reset(self):
-        # Your custom TSDF handles everything in one static VRAM block
         self.tsdf = FastStaticTSDF(voxel_size=0.02, max_depth=5.0, device=self.device)
         
         self.prev_overlap_raw_pts = []
@@ -55,20 +60,44 @@ class StreamingWindowEngine:
             del preds 
             torch.cuda.empty_cache()
             
-            # --- SCALE ALIGNMENT ---
+            # =========================================================
+            # METRICFICATION & DYNAMIC SCALE CORRECTION
+            # =========================================================
+            mid_idx = self.window_size // 2
+            floor_scale, floor_conf = estimate_metric_scale_from_floor(
+                pts_list[mid_idx], 
+                target_camera_height=self.target_camera_height
+            )
+            
             if self.is_first_window:
-                first_depth = np.linalg.norm(pts_list[0], axis=-1)
-                valid_depths = first_depth[first_depth > 0.1]
-                if len(valid_depths) > 0:
-                    self.current_metric_scale = 3.0 / np.median(valid_depths)
+                if floor_scale is not None:
+                    self.current_metric_scale = floor_scale
+                    print(f"  [Metric] INITIALIZED via Floor | Conf: {floor_conf:.2f} | Scale: {floor_scale:.3f}")
+                else:
+                    print("  [Metric] WARNING: No clear floor on Frame 1. Using fallback median.")
+                    first_depth = np.linalg.norm(pts_list[0], axis=-1)
+                    valid_depths = first_depth[first_depth > 0.1]
+                    if len(valid_depths) > 0:
+                        self.current_metric_scale = 3.0 / np.median(valid_depths)
             else:
+                # 1. Get relative scale drift from PanoVGGT
                 raw_scale_diff = align_cam_pts_irls(
                     torch.from_numpy(pts_list[0].copy()), 
                     torch.from_numpy(self.prev_overlap_raw_pts[0].copy()), 
                     torch.from_numpy(window_masks[0].copy())
                 )
                 clipped_scale = np.clip(raw_scale_diff, 0.95, 1.05)
-                self.current_metric_scale *= (0.8 * 1.0 + 0.2 * clipped_scale)
+                relative_scale = self.current_metric_scale * (0.8 * 1.0 + 0.2 * clipped_scale)
+                
+                # 2. Gently fuse the Floor Scale if we are confident we are on flat ground
+                # This anchors the scene and completely prevents global shrinking/expanding drift
+                if floor_scale is not None and floor_conf > 0.4:
+                    self.current_metric_scale = 0.9 * relative_scale + 0.1 * floor_scale
+                    print(f"  [Metric] DRIFT CORRECTED via Floor | Conf: {floor_conf:.2f}")
+                else:
+                    self.current_metric_scale = relative_scale
+                    print(f"  [Metric] Relied on Pano (No solid floor detected - e.g. Stairs)")
+            # =========================================================
 
             # --- POSE ALIGNMENT ---
             metric_local_poses = []
@@ -99,7 +128,6 @@ class StreamingWindowEngine:
                 depth_map = np.linalg.norm(scaled_pts, axis=-1)
                 
                 if j >= (0 if self.is_first_window else self.overlap):
-                    # PyTorch handles integration fast without crashing
                     self.tsdf.integrate(depth_map, window_frames[j], window_masks[j], global_pose)
                     
                 if j >= self.window_size - self.overlap:
@@ -112,15 +140,22 @@ class StreamingWindowEngine:
             self.submap_count += 1
             print(f"  [Profile] Cycle Time: {time.time() - t_win_start:.4f} sec")
             
-            # Yield a lightweight pointcloud preview to the UI
+            # Send a fast preview during mapping
             live_pcd = self.tsdf.extract_point_cloud()
             yield None, live_pcd, np.array(self.trajectory), []
 
         # --- END OF SEQUENCE ---
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
         
-        # Extract the globally optimized, heavily decimated mesh!
-        # decimation_factor=0.05 will compress a 300MB mesh into ~15MB
+        # 1. Extract and drastically decimate the mesh
         final_mesh = self.tsdf.extract_mesh(decimation_factor=0.05) 
         
-        yield final_mesh, None, np.array(self.trajectory), []
+        # 2. THE DENSITY/SIZE FIX: Extract Point Cloud FROM the mesh vertices
+        # This gives you an ultra-sharp, tiny point cloud identical to nvblox behavior
+        final_pcd = o3d.geometry.PointCloud()
+        final_pcd.points = final_mesh.vertices
+        if final_mesh.has_vertex_colors():
+            final_pcd.colors = final_mesh.vertex_colors
+        
+        # 3. CRASH FIX: Return BOTH the mesh and the new sharp point cloud
+        yield final_mesh, final_pcd, np.array(self.trajectory), []
