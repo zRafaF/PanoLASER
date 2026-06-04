@@ -23,7 +23,7 @@ class StreamingWindowEngine:
         self.tsdf_future = None
         self.tsdf = None
         
-        print("[Engine] Initializing 1.5cm Chunked Fast-Merge Odometry Engine...")
+        print("[Engine] Initializing 1.5cm Chunked Engine with Conservative Outlier Removal...")
         self.reset()
         
     def reset(self):
@@ -57,13 +57,16 @@ class StreamingWindowEngine:
         
         local_mesh = tsdf_instance.extract_mesh()
         
-        # Build ultra-sharp local PCD directly from the mesh vertices
         local_pcd = o3d.geometry.PointCloud()
         local_pcd.points = local_mesh.vertices
         if local_mesh.has_vertex_colors():
             local_pcd.colors = local_mesh.vertex_colors
             
-        # GHOST BUSTER: Delete floating edge artifacts before they join the global map
+        # =========================================================
+        # THE GHOST POINT FIX: Conservative Statistical Outlier Removal
+        # Checks if a point has 40 neighbors within a tight standard deviation. 
+        # If not, it is classified as a floating ghost artifact and deleted.
+        # =========================================================
         if len(local_pcd.points) > 50:
             local_pcd, _ = local_pcd.remove_statistical_outlier(nb_neighbors=40, std_ratio=2.0)
             
@@ -84,16 +87,13 @@ class StreamingWindowEngine:
             print(f"\n==========================================")
             print(f"[Engine] Processing Submap {self.submap_count}...")
             
-            # --- PHASE 1: RECLAIM GPU & INSTANT CHUNK MERGE ---
             t0 = time.time()
             if self.tsdf_future is not None:
                 local_mesh, local_pcd = self.tsdf_future.result()
                 
-                # Directly append (Poses are already in Global coordinates!)
                 self.global_pcd += local_pcd
                 self.global_mesh += local_mesh
                 
-                # FAST ZIPPER: Merges overlapping walls instantly without slow ICP
                 self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.015)
                 self.global_mesh = self.global_mesh.simplify_vertex_clustering(
                     voxel_size=0.015, contraction=o3d.geometry.SimplificationContraction.Average
@@ -107,7 +107,6 @@ class StreamingWindowEngine:
                 self.tsdf_executor.submit(lambda: None).result()
             profiler["Chunk_Merge_&_GC"] = time.time() - t0
             
-            # --- PHASE 2: VGGT TRANSFORMER INFERENCE ---
             t1 = time.time()
             with torch.inference_mode():
                 preds = self.engine(window_frames)
@@ -119,7 +118,6 @@ class StreamingWindowEngine:
             del preds 
             torch.cuda.empty_cache()
             
-            # --- PHASE 3: METRICFICATION & ALIGNMENT ---
             t2 = time.time()
             mid_idx = self.window_size // 2
             floor_scale, floor_conf = estimate_metric_scale_from_floor(
@@ -193,7 +191,6 @@ class StreamingWindowEngine:
             self.is_first_window = False
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 
-            # --- PHASE 4: ASYNC INTEGRATION ---
             t3 = time.time()
             self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=4.5, crop_margin=24, device=self.device)
             self.tsdf_future = self.tsdf_executor.submit(
@@ -204,13 +201,11 @@ class StreamingWindowEngine:
             self.submap_count += 1
             total_time = time.time() - t_win_start
             
-            # --- PRINT PROFILING REPORT ---
             print("  --- Performance Profile ---")
             for k, v in profiler.items():
                 print(f"    - {k:<30}: {v:.4f} sec")
             print(f"  >>> Total Cycle Time: {total_time:.4f} sec")
             
-            # YIELD LIVE STREAM
             safe_pcd = self.global_pcd
             safe_mesh = self.global_mesh
             if len(safe_pcd.points) == 0:
@@ -220,7 +215,6 @@ class StreamingWindowEngine:
                 
             yield safe_mesh, safe_pcd, np.array(self.trajectory), []
 
-        # --- END OF SEQUENCE ---
         if self.tsdf_future is not None:
             local_mesh, local_pcd = self.tsdf_future.result()
             self.global_pcd += local_pcd
