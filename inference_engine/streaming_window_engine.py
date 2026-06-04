@@ -23,7 +23,7 @@ class StreamingWindowEngine:
         self.tsdf_future = None
         self.tsdf = None
         
-        print("[Engine] Initializing O(1) Streaming Engine with Ghost Point Removal...")
+        print("[Engine] Initializing 1cm Ultra-Dense O(1) Engine...")
         self.reset()
         
     def reset(self):
@@ -57,11 +57,7 @@ class StreamingWindowEngine:
         
         local_mesh = tsdf_instance.extract_mesh()
         
-        # =========================================================
-        # THE GREY HALO AMPUTATION
-        # Mathematically identifies and deletes any vertices caught in the 
-        # invisible TSDF truncation band that didn't receive color (127/255 grey).
-        # =========================================================
+        # Grey Halo Amputation (Removes 127/255 grey uncolored borders)
         if local_mesh.has_vertex_colors():
             colors = np.asarray(local_mesh.vertex_colors)
             grey_val = 127 / 255.0
@@ -78,9 +74,15 @@ class StreamingWindowEngine:
         if local_mesh.has_vertex_colors():
             local_pcd.colors = local_mesh.vertex_colors
             
-        # CONSERVATIVE GHOST REMOVAL: Clean up the local chunk before it enters the global map
-        if len(local_pcd.points) > 50:
-            local_pcd, _ = local_pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=2.0)
+        # Local 1cm Optimization
+        if len(local_pcd.points) > 0:
+            local_pcd = local_pcd.voxel_down_sample(voxel_size=0.01)
+            local_mesh = local_mesh.simplify_vertex_clustering(
+                voxel_size=0.01, contraction=o3d.geometry.SimplificationContraction.Average
+            )
+            
+            if len(local_pcd.points) > 50:
+                local_pcd, _ = local_pcd.remove_radius_outlier(nb_points=15, radius=0.05)
             
         return local_mesh, local_pcd
 
@@ -93,9 +95,6 @@ class StreamingWindowEngine:
             t_win_start = time.time()
             profiler = {}
             
-            window_frames = frames[i : i + self.window_size]
-            window_masks = masks[i : i + self.window_size]
-            
             print(f"\n==========================================")
             print(f"[Engine] Processing Submap {self.submap_count}...")
             
@@ -103,7 +102,7 @@ class StreamingWindowEngine:
             if self.tsdf_future is not None:
                 local_mesh, local_pcd = self.tsdf_future.result()
                 
-                # INSTANT O(1) APPEND: The bottleneck is gone.
+                # INSTANT O(1) APPEND
                 self.global_pcd += local_pcd
                 self.global_mesh += local_mesh
                 
@@ -200,7 +199,8 @@ class StreamingWindowEngine:
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 
             t3 = time.time()
-            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=4.5, crop_margin=24, device=self.device)
+            # 1cm Voxel and 3.5m Max Depth Passed Here
+            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.01, max_depth=3.5, crop_margin=24, device=self.device)
             self.tsdf_future = self.tsdf_executor.submit(
                 self._async_tsdf_task, self.tsdf, batch_depths, batch_rgbs, batch_masks, batch_poses
             )
@@ -214,7 +214,6 @@ class StreamingWindowEngine:
                 print(f"    - {k:<30}: {v:.4f} sec")
             print(f"  >>> Total Cycle Time: {total_time:.4f} sec")
             
-            # Send just the local, sharp chunk to the UI preview
             safe_pcd = self.global_pcd
             safe_mesh = self.global_mesh
             if len(safe_pcd.points) == 0:
@@ -224,17 +223,15 @@ class StreamingWindowEngine:
                 
             yield safe_mesh, safe_pcd, np.array(self.trajectory), []
 
-        # --- END OF SEQUENCE ---
         if self.tsdf_future is not None:
             local_mesh, local_pcd = self.tsdf_future.result()
             self.global_pcd += local_pcd
             self.global_mesh += local_mesh
             
-            # THE ONLY TIME WE DO A FULL GLOBAL OPTIMIZATION
-            print("[Engine] Final Sequence Optimization...")
-            self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.015)
+            print("[Engine] Final Sequence 1cm Zipping...")
+            self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.01)
             self.global_mesh = self.global_mesh.simplify_vertex_clustering(
-                voxel_size=0.015, contraction=o3d.geometry.SimplificationContraction.Average
+                voxel_size=0.01, contraction=o3d.geometry.SimplificationContraction.Average
             )
             
             del self.tsdf_future, self.tsdf

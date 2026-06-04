@@ -7,14 +7,15 @@ from nvblox_torch.mapper import Mapper
 from nvblox_torch.sensor import Sensor
 
 class NvbloxPanoTSDF:
-    def __init__(self, voxel_size_m=0.015, max_depth=4.5, face_size=512, crop_margin=24, device="cuda"):
+    def __init__(self, voxel_size_m=0.01, max_depth=3.5, face_size=512, crop_margin=24, device="cuda"):
         self.device = torch.device(device)
         self.voxel_size_m = voxel_size_m
-        self.max_depth = max_depth
+        # 3.5m Max Depth: Only map high-confidence near points! Prevents far rays from erasing.
+        self.max_depth = max_depth 
         self.face_size = face_size
         self.crop_margin = crop_margin
         
-        print(f"[TSDF] Initializing 6-Face GPU Mapper (Anti-Erasure Forcefield Active)...")
+        print(f"[TSDF] Initializing 1cm GPU Mapper (Forcefield & 3.5m Distance Cap Active)...")
         self.mapper = Mapper(voxel_sizes_m=self.voxel_size_m)
         
         f = self.face_size / 2.0
@@ -75,27 +76,27 @@ class NvbloxPanoTSDF:
             mask = torch.ones_like(pano_depth_map)
             
         # =========================================================
-        # THE ANTI-ERASURE FORCEFIELD (Thin Structure Protection)
+        # THE PROTECTIVE FORCEFIELD (Runs in 0.002 seconds)
         # =========================================================
-        # 1. Find depth jumps (Object Silhouettes)
         depth_shifted_x = torch.cat([pano_depth_map[:, 1:], pano_depth_map[:, -1:]], dim=1)
         depth_shifted_y = torch.cat([pano_depth_map[1:, :], pano_depth_map[-1:, :]], dim=0)
         diff_x = torch.abs(pano_depth_map - depth_shifted_x)
         diff_y = torch.abs(pano_depth_map - depth_shifted_y)
         
-        # Identify sharp drop-offs > 15cm
-        edges = ((diff_x > 0.15) | (diff_y > 0.15)).float()
+        # 1. 8cm Imprinting Mask (Slices away local fuzz)
+        edge_mask = (diff_x < 0.08) & (diff_y < 0.08)
+        mask = mask * edge_mask.float()
         
-        # 2. DILATE the edges to create a 7-pixel safety boundary
-        # This completely blinds the TSDF from casting erasing rays near thin structures!
-        edges_tensor = edges.unsqueeze(0).unsqueeze(0)
-        dilated_edges = F.max_pool2d(edges_tensor, kernel_size=7, stride=1, padding=3).squeeze()
+        # 2. Thin-Object Forcefield (Prevents far rays from erasing door frames)
+        # Find major depth drops (>20cm) and dilate a 5-pixel protective halo around them
+        silhouette_edges = ((diff_x > 0.20) | (diff_y > 0.20)).float()
+        edges_tensor = silhouette_edges.unsqueeze(0).unsqueeze(0)
+        dilated_edges = F.max_pool2d(edges_tensor, kernel_size=5, stride=1, padding=2).squeeze()
         
-        # 3. Apply the forcefield to the master mask
-        edge_mask = (dilated_edges == 0.0).float()
-        mask = mask * edge_mask
+        # Apply forcefield blind spot
+        mask = mask * (dilated_edges == 0.0).float()
         # =========================================================
-        
+
         use_color = pano_rgb is not None
         if use_color:
             if isinstance(pano_rgb, np.ndarray):
@@ -127,6 +128,8 @@ class NvbloxPanoTSDF:
 
                 optical_depth = radial_depth * self.batched_z_mults[i]
                 optical_depth[face_mask < 0.5] = -1.0
+                
+                # Cap the integration distance. Stops noisy far-away geometry from forming!
                 optical_depth[optical_depth > self.max_depth] = -1.0
                 
                 color_face_uint8 = None
@@ -148,11 +151,9 @@ class NvbloxPanoTSDF:
                 
                 self.mapper.add_depth_frame(optical_depth, face_pose_cpu, self.camera)
                 
-                # Tripod color bypass
                 if use_color and i != 5:
                     self.mapper.add_color_frame(color_face_uint8, face_pose_cpu, self.camera)
                     del color_face_uint8
-                    
                     self.mapper.update_color_mesh()
                 
                 del radial_depth, optical_depth, face_pose, face_mask
