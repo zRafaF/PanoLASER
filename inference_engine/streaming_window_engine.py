@@ -23,7 +23,7 @@ class StreamingWindowEngine:
         self.tsdf_future = None
         self.tsdf = None
         
-        print("[Engine] Initializing O(1) Local-Zip Engine with Radius Ghost Busters...")
+        print("[Engine] Initializing O(1) Streaming Engine with Ghost Point Removal...")
         self.reset()
         
     def reset(self):
@@ -57,7 +57,11 @@ class StreamingWindowEngine:
         
         local_mesh = tsdf_instance.extract_mesh()
         
-        # Grey Halo Amputation
+        # =========================================================
+        # THE GREY HALO AMPUTATION
+        # Mathematically identifies and deletes any vertices caught in the 
+        # invisible TSDF truncation band that didn't receive color (127/255 grey).
+        # =========================================================
         if local_mesh.has_vertex_colors():
             colors = np.asarray(local_mesh.vertex_colors)
             grey_val = 127 / 255.0
@@ -69,25 +73,14 @@ class StreamingWindowEngine:
             if len(grey_indices) > 0:
                 local_mesh.remove_vertices_by_index(grey_indices)
                 
-        # Build local PCD
         local_pcd = o3d.geometry.PointCloud()
         local_pcd.points = local_mesh.vertices
         if local_mesh.has_vertex_colors():
             local_pcd.colors = local_mesh.vertex_colors
             
-        # =========================================================
-        # O(1) LOCAL OPTIMIZATION
-        # We only downsample the current submap chunk!
-        # =========================================================
-        if len(local_pcd.points) > 0:
-            local_pcd = local_pcd.voxel_down_sample(voxel_size=0.01)
-            local_mesh = local_mesh.simplify_vertex_clustering(
-                voxel_size=0.01, contraction=o3d.geometry.SimplificationContraction.Average
-            )
-            
-            # RADIUS GHOST BUSTER: Any point without 15 neighbors within 5cm is destroyed.
-            if len(local_pcd.points) > 50:
-                local_pcd, _ = local_pcd.remove_radius_outlier(nb_points=15, radius=0.05)
+        # CONSERVATIVE GHOST REMOVAL: Clean up the local chunk before it enters the global map
+        if len(local_pcd.points) > 50:
+            local_pcd, _ = local_pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=2.0)
             
         return local_mesh, local_pcd
 
@@ -110,10 +103,7 @@ class StreamingWindowEngine:
             if self.tsdf_future is not None:
                 local_mesh, local_pcd = self.tsdf_future.result()
                 
-                # =========================================================
-                # INSTANT O(1) APPEND
-                # No more global clustering here! This takes 0.001 seconds!
-                # =========================================================
+                # INSTANT O(1) APPEND: The bottleneck is gone.
                 self.global_pcd += local_pcd
                 self.global_mesh += local_mesh
                 
@@ -210,7 +200,7 @@ class StreamingWindowEngine:
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 
             t3 = time.time()
-            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.01, max_depth=4.5, crop_margin=24, device=self.device)
+            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=4.5, crop_margin=24, device=self.device)
             self.tsdf_future = self.tsdf_executor.submit(
                 self._async_tsdf_task, self.tsdf, batch_depths, batch_rgbs, batch_masks, batch_poses
             )
@@ -240,11 +230,11 @@ class StreamingWindowEngine:
             self.global_pcd += local_pcd
             self.global_mesh += local_mesh
             
-            # ONE SINGLE GLOBAL ZIPPER AT THE VERY END
-            print("[Engine] Performing final global mesh zipping...")
-            self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.01)
+            # THE ONLY TIME WE DO A FULL GLOBAL OPTIMIZATION
+            print("[Engine] Final Sequence Optimization...")
+            self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.015)
             self.global_mesh = self.global_mesh.simplify_vertex_clustering(
-                voxel_size=0.01, contraction=o3d.geometry.SimplificationContraction.Average
+                voxel_size=0.015, contraction=o3d.geometry.SimplificationContraction.Average
             )
             
             del self.tsdf_future, self.tsdf
