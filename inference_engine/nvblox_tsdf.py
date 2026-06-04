@@ -14,7 +14,7 @@ class NvbloxPanoTSDF:
         self.face_size = face_size
         self.crop_margin = crop_margin
         
-        print(f"[TSDF] Initializing 6-Face GPU Mapper (Anti-Imprinting & Tripod Bypass)...")
+        print(f"[TSDF] Initializing 6-Face GPU Mapper (Anti-Erasure Forcefield Active)...")
         self.mapper = Mapper(voxel_sizes_m=self.voxel_size_m)
         
         f = self.face_size / 2.0
@@ -74,6 +74,28 @@ class NvbloxPanoTSDF:
         else:
             mask = torch.ones_like(pano_depth_map)
             
+        # =========================================================
+        # THE ANTI-ERASURE FORCEFIELD (Thin Structure Protection)
+        # =========================================================
+        # 1. Find depth jumps (Object Silhouettes)
+        depth_shifted_x = torch.cat([pano_depth_map[:, 1:], pano_depth_map[:, -1:]], dim=1)
+        depth_shifted_y = torch.cat([pano_depth_map[1:, :], pano_depth_map[-1:, :]], dim=0)
+        diff_x = torch.abs(pano_depth_map - depth_shifted_x)
+        diff_y = torch.abs(pano_depth_map - depth_shifted_y)
+        
+        # Identify sharp drop-offs > 15cm
+        edges = ((diff_x > 0.15) | (diff_y > 0.15)).float()
+        
+        # 2. DILATE the edges to create a 7-pixel safety boundary
+        # This completely blinds the TSDF from casting erasing rays near thin structures!
+        edges_tensor = edges.unsqueeze(0).unsqueeze(0)
+        dilated_edges = F.max_pool2d(edges_tensor, kernel_size=7, stride=1, padding=3).squeeze()
+        
+        # 3. Apply the forcefield to the master mask
+        edge_mask = (dilated_edges == 0.0).float()
+        mask = mask * edge_mask
+        # =========================================================
+        
         use_color = pano_rgb is not None
         if use_color:
             if isinstance(pano_rgb, np.ndarray):
@@ -95,7 +117,7 @@ class NvbloxPanoTSDF:
                     pano_mask_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=True
                 ).squeeze(0).squeeze(0)
                 
-                # DEPTH NADIR MASK: Only mask the direct center tripod for depth.
+                # Bottom face circular tripod mask
                 if i == 5:
                     u_coords = self.batched_grids[i, :, :, 0]
                     v_coords = self.batched_grids[i, :, :, 1]
@@ -107,9 +129,18 @@ class NvbloxPanoTSDF:
                 optical_depth[face_mask < 0.5] = -1.0
                 optical_depth[optical_depth > self.max_depth] = -1.0
                 
+                color_face_uint8 = None
+                if use_color:
+                    color_face = F.grid_sample(
+                        pano_rgb_tensor, self.batched_grids[i:i+1], mode='bilinear', align_corners=True
+                    ).squeeze(0)
+                    color_face_uint8 = color_face.permute(1, 2, 0).to(torch.uint8).contiguous()
+
                 if self.crop_margin > 0:
                     c = self.crop_margin
                     optical_depth = optical_depth[c:-c, c:-c].contiguous()
+                    if use_color:
+                        color_face_uint8 = color_face_uint8[c:-c, c:-c, :].contiguous()
 
                 face_pose = pose.clone()
                 face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
@@ -117,23 +148,11 @@ class NvbloxPanoTSDF:
                 
                 self.mapper.add_depth_frame(optical_depth, face_pose_cpu, self.camera)
                 
-                # COLOR TRIPOD BYPASS: Completely skip color integration for the bottom face.
-                # The side cameras will color the floor seamlessly, and the tripod is never projected!
+                # Tripod color bypass
                 if use_color and i != 5:
-                    color_face = F.grid_sample(
-                        pano_rgb_tensor, self.batched_grids[i:i+1], mode='bilinear', align_corners=True
-                    ).squeeze(0)
-                    color_face_uint8 = color_face.permute(1, 2, 0).to(torch.uint8).contiguous()
-
-                    if self.crop_margin > 0:
-                        c = self.crop_margin
-                        color_face_uint8 = color_face_uint8[c:-c, c:-c, :].contiguous()
-
                     self.mapper.add_color_frame(color_face_uint8, face_pose_cpu, self.camera)
                     del color_face_uint8
                     
-                    # FLUSH QUEUE: Keep this INSIDE the loop. 
-                    # Instantly clears the 100k bottleneck, saving VRAM and stopping grey dots.
                     self.mapper.update_color_mesh()
                 
                 del radial_depth, optical_depth, face_pose, face_mask
