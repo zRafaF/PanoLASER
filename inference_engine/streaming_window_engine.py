@@ -2,10 +2,8 @@ import torch
 import numpy as np
 import open3d as o3d
 import time
-import gc  
-from concurrent.futures import ThreadPoolExecutor
 
-from .nvblox_tsdf import NvbloxPanoTSDF
+from .tsdf_volume import FastStaticTSDF
 from .inference_utils import align_cam_pts_irls
 from .utils.geometry import register_camera_poses_kabsch
 
@@ -16,21 +14,12 @@ class StreamingWindowEngine:
         self.overlap = overlap
         self.device = device
         
-        self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
-        self.tsdf_future = None
-        self.tsdf = None
-        
-        print("[Engine] Initializing Chunked RAM-Offloading Odometry Engine (with ICP & Zipper)...")
+        print("[Engine] Initializing Pure PyTorch Streaming Odometry Engine...")
         self.reset()
         
     def reset(self):
-        if self.tsdf_future is not None:
-            self.tsdf_future.result()
-            del self.tsdf_future
-            self.tsdf_future = None
-            
-        self.global_pcd = o3d.geometry.PointCloud()
-        self.global_mesh = o3d.geometry.TriangleMesh()
+        # Your custom TSDF handles everything in one static VRAM block
+        self.tsdf = FastStaticTSDF(voxel_size=0.02, max_depth=5.0, device=self.device)
         
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
@@ -40,22 +29,7 @@ class StreamingWindowEngine:
         self.is_first_window = True
         self.current_metric_scale = 1.0
         
-        if self.tsdf is not None:
-            del self.tsdf
-            self.tsdf = None
-            
-        gc.collect()
         torch.cuda.empty_cache()
-
-    def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
-        # FORCE A FRESH MAPPER FOR EACH SUBMAP TO AVOID MEMORY ACCUMULATION
-        # (Your loop is already doing this, but ensure the integration is tight)
-        for j in range(len(poses)):
-            self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
-        
-        local_pcd = self.tsdf.extract_point_cloud(viz_voxel_scale=1.0)
-        local_mesh = self.tsdf.extract_mesh()
-        return local_mesh, local_pcd
 
     def process_sequence(self, frames, masks):
         self.reset()
@@ -68,46 +42,8 @@ class StreamingWindowEngine:
             window_masks = masks[i : i + self.window_size]
             
             print(f"\n[Engine] Processing Submap {self.submap_count}...")
+            torch.cuda.empty_cache() 
             
-            # --- PHASE 1: RECLAIM GPU VRAM & FUSE CHUNKS ---
-            if self.tsdf_future is not None:
-                local_mesh, local_pcd = self.tsdf_future.result()
-                
-                # 1. Estimate normals for Point-to-Plane ICP
-                local_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-                
-                if len(self.global_pcd.points) > 0:
-                    self.global_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-                    
-                    # 2. ICP Alignment: "Snap" the new chunk into the global map to eliminate drift
-                    print("  [CPU] Snapping chunk via ICP...")
-                    icp_result = o3d.pipelines.registration.registration_icp(
-                        local_pcd, self.global_pcd, 
-                        max_correspondence_distance=0.15, # 15cm search radius for overlap correction
-                        init=np.eye(4),
-                        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane()
-                    )
-                    local_pcd.transform(icp_result.transformation)
-                    local_mesh.transform(icp_result.transformation)
-                
-                # 3. Add to the global map
-                self.global_pcd += local_pcd
-                self.global_mesh += local_mesh
-                
-                # 4. THE ZIPPER: Fuse duplicate overlapping points into single razor-sharp walls!
-                self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.015)
-                
-                # Clean up memory leak
-                del self.tsdf_future
-                self.tsdf_future = None
-                del self.tsdf
-                self.tsdf = None
-                
-                gc.collect()
-                torch.cuda.empty_cache()
-                self.tsdf_executor.submit(lambda: None).result()
-            
-            # --- PHASE 2: VGGT TRANSFORMER INFERENCE ---
             t_gpu = time.time()
             with torch.inference_mode():
                 preds = self.engine(window_frames)
@@ -119,7 +55,7 @@ class StreamingWindowEngine:
             del preds 
             torch.cuda.empty_cache()
             
-            # --- SCALE AND POSE ALIGNMENT ---
+            # --- SCALE ALIGNMENT ---
             if self.is_first_window:
                 first_depth = np.linalg.norm(pts_list[0], axis=-1)
                 valid_depths = first_depth[first_depth > 0.1]
@@ -134,6 +70,7 @@ class StreamingWindowEngine:
                 clipped_scale = np.clip(raw_scale_diff, 0.95, 1.05)
                 self.current_metric_scale *= (0.8 * 1.0 + 0.2 * clipped_scale)
 
+            # --- POSE ALIGNMENT ---
             metric_local_poses = []
             for p in poses:
                 mp = p.copy()
@@ -150,28 +87,20 @@ class StreamingWindowEngine:
                 R_align, t_align = register_camera_poses_kabsch(src_cam_np, tgt_cam_np, scale=1.0)
                 anchor_pose[:3, :3] = R_align
                 anchor_pose[:3, 3] = t_align
-                
-            batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
             
+            # --- INTEGRATION ---
             for j in range(self.window_size):
                 global_pose = anchor_pose @ canonical_poses[j]
                 
                 if j >= (0 if self.is_first_window else self.overlap):
                     self.trajectory.append(global_pose[:3, 3])
                 
-                tsdf_pose = global_pose.copy()
-                if tsdf_pose[1, 1] < 0:
-                    flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-                    tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ flip_R
-
                 scaled_pts = pts_list[j] * self.current_metric_scale
                 depth_map = np.linalg.norm(scaled_pts, axis=-1)
                 
                 if j >= (0 if self.is_first_window else self.overlap):
-                    batch_depths.append(depth_map)
-                    batch_rgbs.append(window_frames[j])
-                    batch_masks.append(window_masks[j])
-                    batch_poses.append(tsdf_pose) 
+                    # PyTorch handles integration fast without crashing
+                    self.tsdf.integrate(depth_map, window_frames[j], window_masks[j], global_pose)
                     
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
@@ -180,56 +109,18 @@ class StreamingWindowEngine:
             
             self.prev_overlap_raw_pts = pts_list[-self.overlap:]
             self.is_first_window = False
-
-            # --- PHASE 3: NVBLOX GPU INTEGRATION ---
-            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.015, max_depth=4.5, device=self.device)
-            
-            self.tsdf_future = self.tsdf_executor.submit(
-                self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
-            )
-            
             self.submap_count += 1
             print(f"  [Profile] Cycle Time: {time.time() - t_win_start:.4f} sec")
             
-            safe_pcd = self.global_pcd
-            if len(safe_pcd.points) == 0:
-                safe_pcd = o3d.geometry.PointCloud()
-                safe_pcd.points = o3d.utility.Vector3dVector([[0.0, 0.0, 0.0]])
-                safe_pcd.colors = o3d.utility.Vector3dVector([[0.0, 0.0, 0.0]])
-                
-            yield None, safe_pcd, np.array(self.trajectory), []
+            # Yield a lightweight pointcloud preview to the UI
+            live_pcd = self.tsdf.extract_point_cloud()
+            yield None, live_pcd, np.array(self.trajectory), []
 
         # --- END OF SEQUENCE ---
-        if self.tsdf_future is not None:
-            local_mesh, local_pcd = self.tsdf_future.result()
-            
-            # Snap final chunk
-            local_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-            if len(self.global_pcd.points) > 0:
-                print("  [CPU] Snapping final chunk via ICP...")
-                icp_result = o3d.pipelines.registration.registration_icp(
-                    local_pcd, self.global_pcd, 
-                    max_correspondence_distance=0.15,
-                    init=np.eye(4),
-                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane()
-                )
-                local_pcd.transform(icp_result.transformation)
-                local_mesh.transform(icp_result.transformation)
-            
-            self.global_pcd += local_pcd
-            self.global_mesh += local_mesh
-            self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.015)
-            
-            del self.tsdf_future
-            self.tsdf_future = None
-            del self.tsdf
-            self.tsdf = None
-            
-            gc.collect()
-            torch.cuda.empty_cache()
-
         print(f"[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
-        self.global_mesh.remove_duplicated_vertices()
         
-        # Yield the fused point cloud instead of None!
-        yield self.global_mesh, self.global_pcd, np.array(self.trajectory), []
+        # Extract the globally optimized, heavily decimated mesh!
+        # decimation_factor=0.05 will compress a 300MB mesh into ~15MB
+        final_mesh = self.tsdf.extract_mesh(decimation_factor=0.05) 
+        
+        yield final_mesh, None, np.array(self.trajectory), []

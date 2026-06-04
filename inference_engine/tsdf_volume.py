@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import open3d as o3d
 import time
-import trimesh # Required: pip install trimesh
+import skimage.measure
 
 class FastStaticTSDF:
     def __init__(self, voxel_size=0.02, margin=0.08, max_depth=6.0, max_blocks=60000, device="cuda"):
@@ -183,10 +183,14 @@ class FastStaticTSDF:
         pcd.colors = o3d.utility.Vector3dVector(colors.cpu().numpy())
         return pcd
 
-    def extract_mesh(self, surface_threshold=None):
-        import skimage.measure
+    def extract_mesh(self, decimation_factor=0.05):
+        """
+        Extracts the mesh and uses Quadric Error Metrics to intelligently decimate 
+        flat surfaces while preserving sharp edges and corners.
+        """
+        print("[TSDF] Extracting volumetric grid for Marching Cubes...")
         
-        # Assemble volumetric grid
+        # Assemble volumetric grid (From your original implementation)
         active_blocks = self.block_coords_tensor[:self.next_idx]
         min_b = active_blocks.min(dim=0)[0]
         max_b = active_blocks.max(dim=0)[0]
@@ -198,13 +202,37 @@ class FastStaticTSDF:
         valid_indices = (rel_blocks.unsqueeze(1) * self.block_res + self.block_template.unsqueeze(0)).view(-1, 3)
         dense_tsdf[valid_indices[:,0].long(), valid_indices[:,1].long(), valid_indices[:,2].long()] = self.tsdf[:self.next_idx].view(-1)
         
-        # Marching Cubes
-        verts, faces, _, _ = skimage.measure.marching_cubes(dense_tsdf.cpu().numpy(), level=0.0)
-        verts_world = verts * self.voxel_size + (min_b.cpu().numpy() * self.block_size)
+        print("[TSDF] Running Marching Cubes...")
+        verts, faces, normals, _ = skimage.measure.marching_cubes(dense_tsdf.cpu().numpy(), level=0.0)
         
-        # Trimesh Simplification for performance
-        mesh = trimesh.Trimesh(vertices=verts_world, faces=faces)
-        if len(mesh.faces) > 500000:
-            mesh = mesh.simplify_quadratic_decimation(500000)
-            
-        return mesh
+        # Shift vertices back to world coordinates
+        verts = (verts / self.block_res) + min_b.cpu().numpy()
+        verts = verts * self.block_size
+        
+        # Create Open3D Mesh
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts)
+        mesh.triangles = o3d.utility.Vector3iVector(faces)
+        
+        # ---------------------------------------------------------
+        # APPLY VERTEX COLORS (Sampled from nearest TSDF voxel)
+        # ---------------------------------------------------------
+        # Note: Implement your color sampling here based on your voxel grid
+        # mesh.vertex_colors = o3d.utility.Vector3dVector(sampled_colors)
+        
+        mesh.compute_vertex_normals()
+        
+        # ---------------------------------------------------------
+        # SMART MESH DECIMATION (Quadric Error Metric)
+        # ---------------------------------------------------------
+        initial_triangles = len(mesh.triangles)
+        target_triangles = max(int(initial_triangles * decimation_factor), 1000)
+        
+        print(f"[TSDF] Decimating mesh from {initial_triangles} -> {target_triangles} triangles...")
+        
+        # simplify_quadric_decimation collapses coplanar geometry into massive triangles
+        # while keeping sharp building corners mathematically perfect.
+        optimized_mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target_triangles)
+        
+        print("[TSDF] Mesh optimization complete!")
+        return optimized_mesh
