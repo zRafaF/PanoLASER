@@ -64,8 +64,11 @@ class HighResTextureBaker:
                 pano_tensor, self.batched_grids[i:i+1], mode='bilinear', align_corners=True
             ).squeeze(0)
             
+            # Convert to numpy, and FORCE contiguous C-style memory for Open3D
             face_np = face_tensor.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
-            faces.append((face_np, self.face_rotations[i]))
+            face_np_contiguous = np.ascontiguousarray(face_np)
+            
+            faces.append((face_np_contiguous, self.face_rotations[i]))
             
         return faces
 

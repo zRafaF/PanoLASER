@@ -39,7 +39,7 @@ class StreamingWindowEngine:
         self.prev_overlap_global_poses = []
         self.trajectory = []
         
-        # --- NEW TRACKING VARIABLES FOR TEXTURE BAKER ---
+        # Tracking variables for texture baker
         self.full_poses = []
         self.processed_indices = []
         
@@ -139,7 +139,6 @@ class StreamingWindowEngine:
                 if j >= start_idx:
                     self.trajectory.append(global_pose[:3, 3])
                     
-                    # --- NEW TRACKING ---
                     absolute_idx = i + j
                     self.processed_indices.append(absolute_idx)
                     self.full_poses.append(global_pose)
@@ -170,9 +169,17 @@ class StreamingWindowEngine:
             )
             profiler["Nvblox_Enqueue"] = time.time() - t3
             
+            # --- Profiling Output Restored ---
+            total_time = time.time() - t_win_start
+            print("  --- Performance Profile ---")
+            for k, v in profiler.items():
+                print(f"    - {k:<30}: {v:.4f} sec")
+            print(f"  >>> Total Cycle Time: {total_time:.4f} sec")
+            # ---------------------------------
+
             self.submap_count += 1
             
-            if self.submap_count % 1 == 0:
+            if self.submap_count % 3 == 0:
                 self.last_mesh = self.tsdf.extract_mesh()
                 self.last_pcd = o3d.geometry.PointCloud()
                 self.last_pcd.points = self.last_mesh.vertices
