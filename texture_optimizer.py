@@ -64,7 +64,6 @@ class HighResTextureBaker:
                 pano_tensor, self.batched_grids[i:i+1], mode='bilinear', align_corners=True
             ).squeeze(0)
             
-            # Convert to numpy, and FORCE contiguous C-style memory for Open3D
             face_np = face_tensor.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
             face_np_contiguous = np.ascontiguousarray(face_np)
             
@@ -75,6 +74,13 @@ class HighResTextureBaker:
     def run_baking_pass(self, raw_mesh, sequence_frames, global_poses):
         print("\n[Texture Baker] Starting Offline High-Res UV Unwrapping & Baking...")
         
+        # --- 1. MESH QUALITY ENHANCEMENT ---
+        print("[Texture Baker] Enhancing mesh topology (Smoothing & Subdividing)...")
+        # Subdivide to increase triangle count (makes the mesh denser for better texturing)
+        raw_mesh = raw_mesh.subdivide_midpoint(number_of_iterations=1)
+        # Taubin smoothing removes the blocky 'staircase' voxel artifacts without shrinking the room
+        raw_mesh = raw_mesh.filter_smooth_taubin(number_of_iterations=20)
+        
         raw_mesh.compute_vertex_normals()
         # Clear existing low-res vertex colors so Open3D builds an image texture atlas
         raw_mesh.vertex_colors = o3d.utility.Vector3dVector() 
@@ -83,7 +89,6 @@ class HighResTextureBaker:
         images = []
         
         # We don't need every single frame for texturing (saves massive RAM)
-        # Take roughly 1 frame every submap window
         stride = max(1, len(sequence_frames) // 30) 
         
         for idx in range(0, len(sequence_frames), stride):
@@ -93,13 +98,23 @@ class HighResTextureBaker:
             faces = self.extract_pinhole_images(pano_rgb)
             
             for face_img, face_R in faces:
-                o3d_img = o3d.geometry.Image(face_img)
-                images.append(o3d_img)
+                o3d_color = o3d.geometry.Image(face_img)
+                
+                # --- THE FIX: Dummy Depth Map ---
+                # Open3D's optimizer explicitly requires an RGBDImage format.
+                # We create a dummy flat depth map to satisfy the API.
+                dummy_depth = np.ones((self.face_size, self.face_size), dtype=np.float32) * 2.0
+                o3d_depth = o3d.geometry.Image(dummy_depth)
+                
+                o3d_rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                    o3d_color, o3d_depth, 
+                    depth_scale=1.0, depth_trunc=10.0, convert_rgb_to_intensity=False
+                )
+                
+                images.append(o3d_rgbd)
                 
                 face_pose = base_pose.copy()
                 face_pose[:3, :3] = base_pose[:3, :3] @ face_R
-                
-                # Extrinsics are world-to-camera (inverse of our camera-to-world poses)
                 extrinsic = np.linalg.inv(face_pose)
                 
                 cam_param = o3d.camera.PinholeCameraParameters()
@@ -109,11 +124,16 @@ class HighResTextureBaker:
 
         print(f"[Texture Baker] Baking {len(images)} high-res pinhole views onto the mesh...")
         
+        # Loosen the depth visibility checks so our dummy depth map is accepted
+        options = o3d.pipelines.color_map.RigidOptimizerOption()
+        options.maximum_allowable_depth = 10.0
+        options.depth_threshold_for_visiblity_check = 10.0
+        
         o3d.pipelines.color_map.run_rigid_optimizer(
             raw_mesh, 
             images, 
             camera_trajectory, 
-            o3d.pipelines.color_map.RigidOptimizerOption(maximum_allowable_depth=4.0)
+            options
         )
         
         print("[Texture Baker] Baking Complete!")
