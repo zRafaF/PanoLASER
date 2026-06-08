@@ -31,7 +31,7 @@ class StreamingWindowEngine:
             self.tsdf_future = None
             
         # Initialize Global TSDF Mapper ONCE
-        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.07, max_depth=4.5, crop_margin=24, device=self.device)
+        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.04, max_depth=4.0, crop_margin=24, device=self.device)
         
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
@@ -177,25 +177,30 @@ class StreamingWindowEngine:
             
             # Update the UI with the real mesh every 3 windows so the user isn't blind
             if self.submap_count % 3 == 0:
-                safe_mesh = self.tsdf.extract_mesh()
-                safe_pcd.points = safe_mesh.vertices
-                if safe_mesh.has_vertex_colors():
-                    safe_pcd.colors = safe_mesh.vertex_colors
+                self.last_mesh = self.tsdf.extract_mesh()
+                self.last_pcd = o3d.geometry.PointCloud()
+                self.last_pcd.points = self.last_mesh.vertices
+                if self.last_mesh.has_vertex_colors():
+                    self.last_pcd.colors = self.last_mesh.vertex_colors
 
-            # Fallback to prevent Open3D from failing to write a 0-point file
-            if len(safe_pcd.points) == 0:
-                # Yield the camera trajectory as a point cloud so the UI shows movement
-                if len(self.trajectory) > 0:
-                    safe_pcd.points = o3d.utility.Vector3dVector(np.array(self.trajectory))
-                    safe_pcd.paint_uniform_color([1.0, 0.0, 0.0]) # Red trajectory line
-                else:
-                    safe_pcd.points = o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0]]))
+            yield_mesh = self.last_mesh
+            yield_pcd = self.last_pcd
+
+            # Fallback for the very first frames before the cache is populated
+            if yield_mesh is None or len(yield_mesh.vertices) == 0:
+                yield_mesh = o3d.geometry.TriangleMesh()
+                yield_pcd = o3d.geometry.PointCloud()
                 
-                # Give the mesh a microscopic hidden triangle
-                safe_mesh.vertices = o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.0, 0.001, 0.0]]))
-                safe_mesh.triangles = o3d.utility.Vector3iVector(np.array([[0, 1, 2]]))
+                if len(self.trajectory) > 0:
+                    yield_pcd.points = o3d.utility.Vector3dVector(np.array(self.trajectory))
+                    yield_pcd.paint_uniform_color([1.0, 0.0, 0.0]) # Red trajectory line
+                else:
+                    yield_pcd.points = o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0]]))
+                
+                yield_mesh.vertices = o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.0, 0.001, 0.0]]))
+                yield_mesh.triangles = o3d.utility.Vector3iVector(np.array([[0, 1, 2]]))
 
-            yield safe_mesh, safe_pcd, np.array(self.trajectory), []
+            yield yield_mesh, yield_pcd, np.array(self.trajectory), []
 
         # ==========================================
         # Await final integration chunk at sequence end

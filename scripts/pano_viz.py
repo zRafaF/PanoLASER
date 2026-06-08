@@ -4,11 +4,6 @@ from tkinter import filedialog
 import numpy as np
 import open3d as o3d
 
-def create_camera_frustum(pose, size=0.2):
-    camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
-    camera_frame.transform(pose)
-    return camera_frame
-
 def load_npz_node(file_path):
     print(f"📦 Loading local node: {os.path.basename(file_path)}")
     data = np.load(file_path)
@@ -21,63 +16,73 @@ def load_npz_node(file_path):
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.colors = o3d.utility.Vector3dVector(colors)
     
-    geometries = [{"name": "Point Cloud", "geometry": pcd}]
-    
-    # Auto-detect matching ground truth pose file
-    dir_name = os.path.dirname(file_path)
-    base_name = os.path.basename(file_path)
-    
-    if base_name.startswith("node_"):
-        frame_idx = base_name.split("_")[1].split(".")[0]
-        pose_path = os.path.join(dir_name, f"pose_{frame_idx}.npy")
-        
-        if os.path.exists(pose_path):
-            print(f"📍 Found matching pose file: pose_{frame_idx}.npy")
-            pose = np.load(pose_path)
-            geometries.append({"name": f"Camera_{frame_idx}", "geometry": create_camera_frustum(pose, size=0.5)})
-        else:
-            print("⚠️ No matching pose file found in directory. Displaying point cloud only.")
-            
-    return geometries
+    return [{"name": "Point Cloud", "geometry": pcd}]
 
 def load_global_map(file_path):
     print(f"🌍 Loading global map: {os.path.basename(file_path)}")
     pcd = o3d.io.read_point_cloud(file_path)
-    geometries = [{"name": "Global Map", "geometry": pcd}]
     
-    dir_name = os.path.dirname(file_path)
-    # Check for both possible names depending on which step you downloaded from
-    traj_path_1 = os.path.join(dir_name, "trajectory.npy")
-    traj_path_2 = os.path.join(dir_name, "FINAL_Trajectory.npy")
+    return [{"name": "Global Map", "geometry": pcd}]
+
+def load_glb_model(file_path):
+    print(f"🧊 Loading 3D model: {os.path.basename(file_path)}")
     
-    traj_path = traj_path_1 if os.path.exists(traj_path_1) else traj_path_2
+    # Attempt 1: Native Open3D
+    mesh = o3d.io.read_triangle_mesh(file_path)
     
-    if os.path.exists(traj_path):
-        print("📍 Found matching trajectory! Loading camera path...")
-        trajectory = np.load(traj_path)
-        for i, pose in enumerate(trajectory):
-            geometries.append({"name": f"Node_{i}", "geometry": create_camera_frustum(pose, size=0.3)})
-    else:
-        print("⚠️ No trajectory file found. Displaying map only.")
+    # If Open3D fails due to Assimp buffer issues, it returns a mesh with 0 vertices
+    if not mesh.has_vertices():
+        print("⚠️ Open3D failed to parse GLB buffers. Falling back to Trimesh...")
+        try:
+            import trimesh
+        except ImportError:
+            print("❌ 'trimesh' is required to load this GLB. Please run: pip install trimesh")
+            return []
+            
+        # Attempt 2: Trimesh Fallback
+        # force='mesh' attempts to load the scene directly as a single mesh object
+        scene_or_mesh = trimesh.load(file_path, force='mesh')
         
-    return geometries
+        # If Trimesh returns a Scene with multiple objects, flatten it into one mesh
+        if isinstance(scene_or_mesh, trimesh.Scene):
+            geom = scene_or_mesh.dump(concatenate=True)
+        else:
+            geom = scene_or_mesh
+            
+        # Convert Trimesh data structures back into Open3D structures
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(geom.vertices)
+        mesh.triangles = o3d.utility.Vector3iVector(geom.faces)
+        
+        # Pull vertex colors if the GLB has them
+        if hasattr(geom.visual, 'vertex_colors') and geom.visual.vertex_colors is not None:
+            # Trimesh stores colors as 0-255, Open3D needs 0.0-1.0
+            colors = geom.visual.vertex_colors[:, :3] / 255.0
+            mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+            
+    # Compute vertex normals to ensure proper lighting in the viewer
+    if not mesh.has_vertex_normals():
+        mesh.compute_vertex_normals()
+        
+    return [{"name": "GLB Model", "geometry": mesh}]
 
 def main():
     root = tk.Tk()
     root.withdraw() 
     root.attributes('-topmost', True)
 
-    print("📂 Please select a Point Cloud file to open...")
+    print("📂 Please select a Point Cloud or 3D Model file to open...")
     
     current_directory = os.getcwd() 
     
     file_path = filedialog.askopenfilename(
         initialdir=current_directory,
-        title="Select PanoVGGT Point Cloud",
+        title="Select 3D File",
         filetypes=[
-            ("All Supported Files", "*.npz *.ply"),
+            ("All Supported Files", "*.npz *.ply *.glb"),
             ("Single Node (.npz)", "*.npz"),
-            ("Global Map (.ply)", "*.ply")
+            ("Global Map (.ply)", "*.ply"),
+            ("3D Model (.glb)", "*.glb")
         ]
     )
     
@@ -87,12 +92,18 @@ def main():
 
     ext = os.path.splitext(file_path)[1].lower()
     if ext == '.npz':
-        # Now calls the updated single-node loader
         geometries = load_npz_node(file_path)
     elif ext == '.ply':
         geometries = load_global_map(file_path)
+    elif ext == '.glb':
+        geometries = load_glb_model(file_path)
     else:
         print(f"❌ Unsupported file type: {ext}")
+        return
+
+    # Check if geometries were successfully loaded before launching viewer
+    if not geometries:
+        print("❌ Failed to load any geometry. Exiting.")
         return
 
     print("🚀 Launching Modern 3D Viewer...")
