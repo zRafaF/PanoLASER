@@ -8,6 +8,7 @@ from .nvblox_tsdf import NvbloxPanoTSDF
 from .inference_utils import align_cam_pts_irls
 from .utils.geometry import register_camera_poses_kabsch
 from .metricfication import estimate_metric_scale_from_floor
+from .vram_profiler import VRAMProfiler
 
 class StreamingWindowEngine:
     def __init__(self, vanilla_engine, window_size=16, overlap=2, device="cuda"):
@@ -17,6 +18,7 @@ class StreamingWindowEngine:
         self.device = device
         
         self.target_camera_height = 1.7 
+        self.vram_tracker = VRAMProfiler()
         
         self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
         self.tsdf_future = None
@@ -33,7 +35,7 @@ class StreamingWindowEngine:
         self.last_mesh = None
         self.last_pcd = None
             
-        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.05, max_depth=3.5, crop_margin=24, device=self.device)
+        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.025, max_depth=3.5, crop_margin=24, device=self.device)
         
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
@@ -58,6 +60,7 @@ class StreamingWindowEngine:
         t_seq_start = time.time()
         
         for i in range(0, num_frames - self.window_size + 1, self.window_size - self.overlap):
+            self.vram_tracker.start() # Start memory profiling for this batch
             t_win_start = time.time()
             profiler = {}
 
@@ -169,12 +172,17 @@ class StreamingWindowEngine:
             )
             profiler["Nvblox_Enqueue"] = time.time() - t3
             
-            # --- Profiling Output Restored ---
+            # --- Profiling & VRAM Output ---
+            avg_alloc, max_alloc, avg_res, max_res = self.vram_tracker.stop()
             total_time = time.time() - t_win_start
+            
             print("  --- Performance Profile ---")
             for k, v in profiler.items():
                 print(f"    - {k:<30}: {v:.4f} sec")
             print(f"  >>> Total Cycle Time: {total_time:.4f} sec")
+            print("  --- GPU Memory (VRAM) ---")
+            print(f"    - Allocated : {avg_alloc:.2f} GB (Avg) | {max_alloc:.2f} GB (Peak)")
+            print(f"    - Reserved  : {avg_res:.2f} GB (Avg) | {max_res:.2f} GB (Peak)")
             # ---------------------------------
 
             self.submap_count += 1
