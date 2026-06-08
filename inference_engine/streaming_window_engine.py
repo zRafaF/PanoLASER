@@ -2,7 +2,6 @@ import torch
 import numpy as np
 import open3d as o3d
 import time
-import gc  
 from concurrent.futures import ThreadPoolExecutor
 
 from .nvblox_tsdf import NvbloxPanoTSDF
@@ -23,17 +22,16 @@ class StreamingWindowEngine:
         self.tsdf_future = None
         self.tsdf = None
         
-        print("[Engine] Initializing 1cm Ultra-Dense O(1) Engine...")
+        print("[Engine] Initializing Global Nvblox Streaming Engine...")
         self.reset()
         
     def reset(self):
         if self.tsdf_future is not None:
             self.tsdf_future.result()
-            del self.tsdf_future
             self.tsdf_future = None
             
-        self.global_pcd = o3d.geometry.PointCloud()
-        self.global_mesh = o3d.geometry.TriangleMesh()
+        # Initialize Global TSDF Mapper ONCE
+        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.01, max_depth=3.5, crop_margin=24, device=self.device)
         
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
@@ -42,49 +40,12 @@ class StreamingWindowEngine:
         self.submap_count = 0
         self.is_first_window = True
         self.current_metric_scale = 1.0
-        
-        if self.tsdf is not None:
-            del self.tsdf
-            self.tsdf = None
-            
-        gc.collect()
-        torch.cuda.empty_cache()
 
-    def _async_tsdf_task(self, tsdf_instance, depth_maps, rgb_frames, masks, poses):
+    def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
+        """Integrates a batch of strictly new frames into the global TSDF volume."""
         for j in range(len(poses)):
-            tsdf_instance.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
+            self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
         torch.cuda.synchronize()
-        
-        local_mesh = tsdf_instance.extract_mesh()
-        
-        # Grey Halo Amputation (Removes 127/255 grey uncolored borders)
-        if local_mesh.has_vertex_colors():
-            colors = np.asarray(local_mesh.vertex_colors)
-            grey_val = 127 / 255.0
-            is_grey = (np.abs(colors[:, 0] - grey_val) < 1e-3) & \
-                      (np.abs(colors[:, 1] - grey_val) < 1e-3) & \
-                      (np.abs(colors[:, 2] - grey_val) < 1e-3)
-            
-            grey_indices = np.where(is_grey)[0]
-            if len(grey_indices) > 0:
-                local_mesh.remove_vertices_by_index(grey_indices)
-                
-        local_pcd = o3d.geometry.PointCloud()
-        local_pcd.points = local_mesh.vertices
-        if local_mesh.has_vertex_colors():
-            local_pcd.colors = local_mesh.vertex_colors
-            
-        # Local 1cm Optimization
-        if len(local_pcd.points) > 0:
-            local_pcd = local_pcd.voxel_down_sample(voxel_size=0.01)
-            local_mesh = local_mesh.simplify_vertex_clustering(
-                voxel_size=0.01, contraction=o3d.geometry.SimplificationContraction.Average
-            )
-            
-            if len(local_pcd.points) > 50:
-                local_pcd, _ = local_pcd.remove_radius_outlier(nb_points=15, radius=0.05)
-            
-        return local_mesh, local_pcd
 
     def process_sequence(self, frames, masks):
         self.reset()
@@ -101,21 +62,12 @@ class StreamingWindowEngine:
             print(f"\n==========================================")
             print(f"[Engine] Processing Submap {self.submap_count}...")
             
+            # Await previous TSDF integration before queueing more
             t0 = time.time()
             if self.tsdf_future is not None:
-                local_mesh, local_pcd = self.tsdf_future.result()
-                
-                # INSTANT O(1) APPEND
-                self.global_pcd += local_pcd
-                self.global_mesh += local_mesh
-                
-                del self.tsdf_future, self.tsdf
+                self.tsdf_future.result()
                 self.tsdf_future = None
-                self.tsdf = None
-                gc.collect()
-                torch.cuda.empty_cache()
-                self.tsdf_executor.submit(lambda: None).result()
-            profiler["Chunk_Merge_&_GC"] = time.time() - t0
+            profiler["TSDF_Sync"] = time.time() - t0
             
             t1 = time.time()
             with torch.inference_mode():
@@ -126,7 +78,6 @@ class StreamingWindowEngine:
             pts_list = [p.cpu().numpy() if isinstance(p, torch.Tensor) else p for p in preds["points"]]
             poses = [p.cpu().numpy() if isinstance(p, torch.Tensor) else p for p in preds["poses"]]
             del preds 
-            torch.cuda.empty_cache()
             
             t2 = time.time()
             mid_idx = self.window_size // 2
@@ -176,21 +127,26 @@ class StreamingWindowEngine:
                 anchor_pose[:3, 3] = t_align
                 
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
+            
+            # Crucial Fix: Only integrate the NEW frames into the TSDF to prevent duplication blur
+            start_idx = 0 if self.is_first_window else self.overlap
+            
             for j in range(self.window_size):
                 global_pose = anchor_pose @ canonical_poses[j]
-                if j >= (0 if self.is_first_window else self.overlap):
-                    self.trajectory.append(global_pose[:3, 3])
                 
-                tsdf_pose = global_pose.copy()
-                if tsdf_pose[1, 1] < 0:
-                    flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-                    tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ flip_R
+                if j >= start_idx:
+                    self.trajectory.append(global_pose[:3, 3])
+                    
+                    tsdf_pose = global_pose.copy()
+                    if tsdf_pose[1, 1] < 0:
+                        flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+                        tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ flip_R
 
-                scaled_pts = pts_list[j] * self.current_metric_scale
-                batch_depths.append(np.linalg.norm(scaled_pts, axis=-1))
-                batch_rgbs.append(window_frames[j])
-                batch_masks.append(window_masks[j])
-                batch_poses.append(tsdf_pose) 
+                    scaled_pts = pts_list[j] * self.current_metric_scale
+                    batch_depths.append(np.linalg.norm(scaled_pts, axis=-1))
+                    batch_rgbs.append(window_frames[j])
+                    batch_masks.append(window_masks[j])
+                    batch_poses.append(tsdf_pose) 
                     
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
@@ -202,12 +158,10 @@ class StreamingWindowEngine:
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 
             t3 = time.time()
-            # 1cm Voxel and 3.5m Max Depth Passed Here
-            self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.01, max_depth=3.5, crop_margin=24, device=self.device)
             self.tsdf_future = self.tsdf_executor.submit(
-                self._async_tsdf_task, self.tsdf, batch_depths, batch_rgbs, batch_masks, batch_poses
+                self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
             )
-            profiler["Nvblox_Spawn"] = time.time() - t3
+            profiler["Nvblox_Enqueue"] = time.time() - t3
             
             self.submap_count += 1
             total_time = time.time() - t_win_start
@@ -217,29 +171,24 @@ class StreamingWindowEngine:
                 print(f"    - {k:<30}: {v:.4f} sec")
             print(f"  >>> Total Cycle Time: {total_time:.4f} sec")
             
-            safe_pcd = self.global_pcd
-            safe_mesh = self.global_mesh
-            if len(safe_pcd.points) == 0:
-                safe_pcd = o3d.geometry.PointCloud()
-                safe_pcd.points = o3d.utility.Vector3dVector([[0.0, 0.0, 0.0]])
-                safe_mesh = o3d.geometry.TriangleMesh()
-                
-            yield safe_mesh, safe_pcd, np.array(self.trajectory), []
+            # Yield empty placeholders to keep outer loops/visualization alive,
+            # as computing the mesh every frame would bottleneck the streaming logic.
+            empty_mesh = o3d.geometry.TriangleMesh()
+            empty_pcd = o3d.geometry.PointCloud()
+            yield empty_mesh, empty_pcd, np.array(self.trajectory), []
 
+        # Await final integration chunk
         if self.tsdf_future is not None:
-            local_mesh, local_pcd = self.tsdf_future.result()
-            self.global_pcd += local_pcd
-            self.global_mesh += local_mesh
-            
-            print("[Engine] Final Sequence 1cm Zipping...")
-            self.global_pcd = self.global_pcd.voxel_down_sample(voxel_size=0.01)
-            self.global_mesh = self.global_mesh.simplify_vertex_clustering(
-                voxel_size=0.01, contraction=o3d.geometry.SimplificationContraction.Average
-            )
-            
-            del self.tsdf_future, self.tsdf
-            gc.collect()
-            torch.cuda.empty_cache()
+            self.tsdf_future.result()
+
+        print("[Engine] Final Sequence: Extracting Unified Global Mesh...")
+        final_mesh = self.tsdf.extract_mesh()
+        
+        # Keep PointCloud conversion for API backwards compatibility if your viewer expects it
+        final_pcd = o3d.geometry.PointCloud()
+        final_pcd.points = final_mesh.vertices
+        if final_mesh.has_vertex_colors():
+            final_pcd.colors = final_mesh.vertex_colors
 
         print(f"\n[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
-        yield self.global_mesh, self.global_pcd, np.array(self.trajectory), []
+        yield final_mesh, final_pcd, np.array(self.trajectory), []
