@@ -33,19 +33,21 @@ class StreamingWindowEngine:
         self.last_mesh = None
         self.last_pcd = None
             
-        # Initialize Global TSDF Mapper ONCE
-        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.04, max_depth=3.5, crop_margin=24, device=self.device)
+        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.05, max_depth=3.5, crop_margin=24, device=self.device)
         
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
         self.trajectory = []
+        
+        # --- NEW TRACKING VARIABLES FOR TEXTURE BAKER ---
+        self.full_poses = []
+        self.processed_indices = []
         
         self.submap_count = 0
         self.is_first_window = True
         self.current_metric_scale = 1.0
 
     def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
-        """Integrates a batch of strictly new frames into the global TSDF volume."""
         for j in range(len(poses)):
             self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
         torch.cuda.synchronize()
@@ -65,7 +67,6 @@ class StreamingWindowEngine:
             print(f"\n==========================================")
             print(f"[Engine] Processing Submap {self.submap_count}...")
             
-            # Await previous TSDF integration before queueing more
             t0 = time.time()
             if self.tsdf_future is not None:
                 self.tsdf_future.result()
@@ -93,7 +94,6 @@ class StreamingWindowEngine:
                     self.current_metric_scale = floor_scale
                     print(f"  > [Metric] Floor Detected | Conf: {floor_conf:.2f} | Scale: {floor_scale:.3f}")
                 else:
-                    print("  > [Metric] Warning: No floor found. Using median fallback.")
                     first_depth = np.linalg.norm(pts_list[0], axis=-1)
                     valid_depths = first_depth[first_depth > 0.1]
                     if len(valid_depths) > 0:
@@ -131,7 +131,6 @@ class StreamingWindowEngine:
                 
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
             
-            # Crucial Fix: Only integrate the NEW frames into the TSDF to prevent duplication blur
             start_idx = 0 if self.is_first_window else self.overlap
             
             for j in range(self.window_size):
@@ -139,6 +138,11 @@ class StreamingWindowEngine:
                 
                 if j >= start_idx:
                     self.trajectory.append(global_pose[:3, 3])
+                    
+                    # --- NEW TRACKING ---
+                    absolute_idx = i + j
+                    self.processed_indices.append(absolute_idx)
+                    self.full_poses.append(global_pose)
                     
                     tsdf_pose = global_pose.copy()
                     if tsdf_pose[1, 1] < 0:
@@ -167,19 +171,8 @@ class StreamingWindowEngine:
             profiler["Nvblox_Enqueue"] = time.time() - t3
             
             self.submap_count += 1
-            total_time = time.time() - t_win_start
             
-            print("  --- Performance Profile ---")
-            for k, v in profiler.items():
-                print(f"    - {k:<30}: {v:.4f} sec")
-            print(f"  >>> Total Cycle Time: {total_time:.4f} sec")
-            
-            # --- THE FIX: Safe Yields for Gradio & Open3D ---
-            safe_pcd = o3d.geometry.PointCloud()
-            safe_mesh = o3d.geometry.TriangleMesh()
-            
-            # Update the UI with the real mesh every 3 windows so the user isn't blind
-            if self.submap_count % 3 == 0:
+            if self.submap_count % 1 == 0:
                 self.last_mesh = self.tsdf.extract_mesh()
                 self.last_pcd = o3d.geometry.PointCloud()
                 self.last_pcd.points = self.last_mesh.vertices
@@ -189,14 +182,13 @@ class StreamingWindowEngine:
             yield_mesh = self.last_mesh
             yield_pcd = self.last_pcd
 
-            # Fallback for the very first frames before the cache is populated
             if yield_mesh is None or len(yield_mesh.vertices) == 0:
                 yield_mesh = o3d.geometry.TriangleMesh()
                 yield_pcd = o3d.geometry.PointCloud()
                 
                 if len(self.trajectory) > 0:
                     yield_pcd.points = o3d.utility.Vector3dVector(np.array(self.trajectory))
-                    yield_pcd.paint_uniform_color([1.0, 0.0, 0.0]) # Red trajectory line
+                    yield_pcd.paint_uniform_color([1.0, 0.0, 0.0]) 
                 else:
                     yield_pcd.points = o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0]]))
                 
@@ -205,15 +197,12 @@ class StreamingWindowEngine:
 
             yield yield_mesh, yield_pcd, np.array(self.trajectory), []
 
-        # ==========================================
-        # Await final integration chunk at sequence end
         if self.tsdf_future is not None:
             self.tsdf_future.result()
 
         print("[Engine] Final Sequence: Extracting Unified Global Mesh...")
         final_mesh = self.tsdf.extract_mesh()
         
-        # Keep PointCloud conversion for API backwards compatibility if your viewer expects it
         final_pcd = o3d.geometry.PointCloud()
         final_pcd.points = final_mesh.vertices
         if final_mesh.has_vertex_colors():
