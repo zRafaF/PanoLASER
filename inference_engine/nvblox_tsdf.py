@@ -5,17 +5,31 @@ import open3d as o3d
 
 from nvblox_torch.mapper import Mapper
 from nvblox_torch.sensor import Sensor
+from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
 
 class NvbloxPanoTSDF:
-    def __init__(self, voxel_size_m=0.01, max_depth=3.5, face_size=512, crop_margin=24, device="cuda"):
+    def __init__(self, voxel_size_m=0.05, max_depth=4.5, face_size=1024, crop_margin=24, device="cuda"):
         self.device = torch.device(device)
         self.voxel_size_m = voxel_size_m
         self.max_depth = max_depth 
         self.face_size = face_size
         self.crop_margin = crop_margin
         
-        print(f"[TSDF] Initializing 1cm Global GPU Mapper (Forcefield & {max_depth}m Distance Cap Active)...")
-        self.mapper = Mapper(voxel_sizes_m=self.voxel_size_m)
+        print(f"[TSDF] Initializing C++ Nvblox Mapper (Strict TSDF Truncation, {max_depth}m Cap)...")
+        
+        # --- NEW: STRICT TSDF PARAMETERS ---
+        # This stops Nvblox from "smearing" far away noise over sharp near geometry
+        proj_params = ProjectiveIntegratorParams()
+        proj_params.projective_integrator_max_integration_distance_m = self.max_depth
+        
+        mapper_params = MapperParams()
+        mapper_params.set_projective_integrator_params(proj_params)
+        
+        self.mapper = Mapper(
+            voxel_sizes_m=self.voxel_size_m,
+            mapper_parameters=mapper_params
+        )
+        # -----------------------------------
         
         f = self.face_size / 2.0
         w = self.face_size - (2 * self.crop_margin)
@@ -61,7 +75,6 @@ class NvbloxPanoTSDF:
 
     @torch.no_grad()
     def integrate(self, pano_depth_map, pano_rgb, mask, pose):
-        # Move inputs to device seamlessly
         if isinstance(pano_depth_map, np.ndarray):
             pano_depth_map = torch.from_numpy(pano_depth_map).float().to(self.device)
         if isinstance(pose, np.ndarray):
@@ -76,25 +89,20 @@ class NvbloxPanoTSDF:
             mask = torch.ones_like(pano_depth_map)
             
         # =========================================================
-        # OPTIMIZED PROTECTIVE FORCEFIELD 
+        # THE PROTECTIVE FORCEFIELD (Fast Tensor Roll)
         # =========================================================
-        # Using torch.roll to avoid intermediate memory allocations
         depth_shifted_x = torch.roll(pano_depth_map, shifts=-1, dims=1)
         depth_shifted_y = torch.roll(pano_depth_map, shifts=-1, dims=0)
-        
         diff_x = torch.abs(pano_depth_map - depth_shifted_x)
         diff_y = torch.abs(pano_depth_map - depth_shifted_y)
         
-        # 1. 8cm Imprinting Mask (Slices away local fuzz)
         edge_mask = (diff_x < 0.08) & (diff_y < 0.08)
         mask = mask * edge_mask.float()
         
-        # 2. Thin-Object Forcefield (Prevents far rays from erasing door frames)
         silhouette_edges = ((diff_x > 0.20) | (diff_y > 0.20)).float()
         edges_tensor = silhouette_edges.unsqueeze(0).unsqueeze(0)
         dilated_edges = F.max_pool2d(edges_tensor, kernel_size=5, stride=1, padding=2).squeeze()
         
-        # Apply forcefield blind spot
         mask = mask * (dilated_edges == 0.0).float()
         # =========================================================
 
@@ -118,7 +126,6 @@ class NvbloxPanoTSDF:
                 pano_mask_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=True
             ).squeeze(0).squeeze(0)
             
-            # Bottom face circular tripod mask
             if i == 5:
                 u_coords = self.batched_grids[i, :, :, 0]
                 v_coords = self.batched_grids[i, :, :, 1]
@@ -129,16 +136,14 @@ class NvbloxPanoTSDF:
             optical_depth = radial_depth * self.batched_z_mults[i]
             optical_depth[face_mask < 0.5] = -1.0
             
-            # Cap the integration distance.
+            # Distance Cap - Essential to stop far geometry from erasing near walls
             optical_depth[optical_depth > self.max_depth] = -1.0
             
             color_face_uint8 = None
-            if use_color and i != 5: # Skip coloring the floor/tripod nadir 
+            if use_color and i != 5:
                 color_face = F.grid_sample(
                     pano_rgb_tensor, self.batched_grids[i:i+1], mode='bilinear', align_corners=True
                 ).squeeze(0)
-                
-                # Convert safely to uint8 for Nvblox mapping
                 if color_face.is_floating_point() and color_face.max() <= 1.0:
                     color_face = color_face * 255.0
                 color_face_uint8 = color_face.permute(1, 2, 0).to(torch.uint8).contiguous()
@@ -153,16 +158,10 @@ class NvbloxPanoTSDF:
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
             face_pose_cpu = face_pose.cpu()
             
-            # Integrate into the global TSDF
             self.mapper.add_depth_frame(optical_depth, face_pose_cpu, self.camera)
-            
             if color_face_uint8 is not None:
                 self.mapper.add_color_frame(color_face_uint8, face_pose_cpu, self.camera)
 
-        # Allow PyTorch to automatically manage its cache, no forced empties
-        del pano_depth_tensor, pano_mask_tensor
-
     def extract_mesh(self):
-        """Extracts the global fused mesh. Call this only when necessary."""
         self.mapper.update_color_mesh()
         return self.mapper.get_color_mesh().to_open3d()

@@ -19,12 +19,13 @@ class StreamingWindowEngine:
         
         self.target_camera_height = 1.7 
         self.vram_tracker = VRAMProfiler()
+        self.max_depth = 5.0
         
         self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
         self.tsdf_future = None
         self.tsdf = None
         
-        print("[Engine] Initializing Global Nvblox Streaming Engine...")
+        print("[Engine] Initializing C++ Nvblox Keyframe Engine...")
         self.reset()
         
     def reset(self):
@@ -35,19 +36,22 @@ class StreamingWindowEngine:
         self.last_mesh = None
         self.last_pcd = None
             
-        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.025, max_depth=3.5, crop_margin=24, device=self.device)
+        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.05, max_depth=self.max_depth, crop_margin=24, device=self.device)
         
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
         self.trajectory = []
         
-        # Tracking variables for texture baker
         self.full_poses = []
         self.processed_indices = []
         
         self.submap_count = 0
         self.is_first_window = True
         self.current_metric_scale = 1.0
+        
+        # --- NEW: Spatial Keyframing Tracker ---
+        self.last_integrated_position = None
+        self.min_translation_m = 0.25  # Only integrate into TSDF if moved 25cm
 
     def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
         for j in range(len(poses)):
@@ -60,7 +64,7 @@ class StreamingWindowEngine:
         t_seq_start = time.time()
         
         for i in range(0, num_frames - self.window_size + 1, self.window_size - self.overlap):
-            self.vram_tracker.start() # Start memory profiling for this batch
+            self.vram_tracker.start()
             t_win_start = time.time()
             profiler = {}
 
@@ -133,29 +137,40 @@ class StreamingWindowEngine:
                 anchor_pose[:3, 3] = t_align
                 
             batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
-            
             start_idx = 0 if self.is_first_window else self.overlap
             
             for j in range(self.window_size):
                 global_pose = anchor_pose @ canonical_poses[j]
                 
                 if j >= start_idx:
-                    self.trajectory.append(global_pose[:3, 3])
+                    current_pos = global_pose[:3, 3]
+                    self.trajectory.append(current_pos)
                     
-                    absolute_idx = i + j
-                    self.processed_indices.append(absolute_idx)
+                    self.processed_indices.append(i + j)
                     self.full_poses.append(global_pose)
                     
-                    tsdf_pose = global_pose.copy()
-                    if tsdf_pose[1, 1] < 0:
-                        flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-                        tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ flip_R
+                    # --- NEW: Spatial Keyframing Logic ---
+                    should_integrate = False
+                    if self.last_integrated_position is None:
+                        should_integrate = True
+                    else:
+                        dist = np.linalg.norm(current_pos - self.last_integrated_position)
+                        if dist >= self.min_translation_m:
+                            should_integrate = True
+                            
+                    if should_integrate:
+                        self.last_integrated_position = current_pos.copy()
+                        
+                        tsdf_pose = global_pose.copy()
+                        if tsdf_pose[1, 1] < 0:
+                            flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+                            tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ flip_R
 
-                    scaled_pts = pts_list[j] * self.current_metric_scale
-                    batch_depths.append(np.linalg.norm(scaled_pts, axis=-1))
-                    batch_rgbs.append(window_frames[j])
-                    batch_masks.append(window_masks[j])
-                    batch_poses.append(tsdf_pose) 
+                        scaled_pts = pts_list[j] * self.current_metric_scale
+                        batch_depths.append(np.linalg.norm(scaled_pts, axis=-1))
+                        batch_rgbs.append(window_frames[j])
+                        batch_masks.append(window_masks[j])
+                        batch_poses.append(tsdf_pose) 
                     
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
@@ -167,9 +182,11 @@ class StreamingWindowEngine:
             profiler["Scale_&_Pose_Math"] = time.time() - t2
 
             t3 = time.time()
-            self.tsdf_future = self.tsdf_executor.submit(
-                self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
-            )
+            if len(batch_poses) > 0:
+                print(f"  > [TSDF] Sending {len(batch_poses)} Keyframes to C++ Background Mapper...")
+                self.tsdf_future = self.tsdf_executor.submit(
+                    self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
+                )
             profiler["Nvblox_Enqueue"] = time.time() - t3
             
             # --- Profiling & VRAM Output ---
@@ -183,10 +200,10 @@ class StreamingWindowEngine:
             print("  --- GPU Memory (VRAM) ---")
             print(f"    - Allocated : {avg_alloc:.2f} GB (Avg) | {max_alloc:.2f} GB (Peak)")
             print(f"    - Reserved  : {avg_res:.2f} GB (Avg) | {max_res:.2f} GB (Peak)")
-            # ---------------------------------
 
             self.submap_count += 1
             
+            # Live UI Update 
             if self.submap_count % 3 == 0:
                 self.last_mesh = self.tsdf.extract_mesh()
                 self.last_pcd = o3d.geometry.PointCloud()
