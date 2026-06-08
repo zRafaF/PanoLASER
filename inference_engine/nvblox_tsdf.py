@@ -8,17 +8,15 @@ from nvblox_torch.sensor import Sensor
 from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
 
 class NvbloxPanoTSDF:
-    def __init__(self, voxel_size_m=0.05, max_depth=4.5, face_size=1024, crop_margin=24, device="cuda"):
+    def __init__(self, voxel_size_m=0.02, max_depth=4.5, face_size=1024, crop_margin=24, device="cuda"):
         self.device = torch.device(device)
         self.voxel_size_m = voxel_size_m
         self.max_depth = max_depth 
         self.face_size = face_size
         self.crop_margin = crop_margin
         
-        print(f"[TSDF] Initializing C++ Nvblox Mapper (Strict TSDF Truncation, {max_depth}m Cap)...")
+        print(f"[TSDF] Initializing C++ Nvblox Mapper ({voxel_size_m}m Voxels, Strict Truncation, {max_depth}m Cap)...")
         
-        # --- NEW: STRICT TSDF PARAMETERS ---
-        # This stops Nvblox from "smearing" far away noise over sharp near geometry
         proj_params = ProjectiveIntegratorParams()
         proj_params.projective_integrator_max_integration_distance_m = self.max_depth
         
@@ -29,7 +27,6 @@ class NvbloxPanoTSDF:
             voxel_sizes_m=self.voxel_size_m,
             mapper_parameters=mapper_params
         )
-        # -----------------------------------
         
         f = self.face_size / 2.0
         w = self.face_size - (2 * self.crop_margin)
@@ -89,7 +86,7 @@ class NvbloxPanoTSDF:
             mask = torch.ones_like(pano_depth_map)
             
         # =========================================================
-        # THE PROTECTIVE FORCEFIELD (Fast Tensor Roll)
+        # THE PROTECTIVE FORCEFIELD (RAY-SHIELDING HALO)
         # =========================================================
         depth_shifted_x = torch.roll(pano_depth_map, shifts=-1, dims=1)
         depth_shifted_y = torch.roll(pano_depth_map, shifts=-1, dims=0)
@@ -99,9 +96,13 @@ class NvbloxPanoTSDF:
         edge_mask = (diff_x < 0.08) & (diff_y < 0.08)
         mask = mask * edge_mask.float()
         
+        # Silhouette edges: identify sharp 20cm leaps in depth
         silhouette_edges = ((diff_x > 0.20) | (diff_y > 0.20)).float()
         edges_tensor = silhouette_edges.unsqueeze(0).unsqueeze(0)
-        dilated_edges = F.max_pool2d(edges_tensor, kernel_size=5, stride=1, padding=2).squeeze()
+        
+        # Kernel 7 applies a massive 3-pixel deadzone around all thin walls
+        # ensuring that slightly misaligned cameras can NEVER shoot through them
+        dilated_edges = F.max_pool2d(edges_tensor, kernel_size=7, stride=1, padding=3).squeeze()
         
         mask = mask * (dilated_edges == 0.0).float()
         # =========================================================

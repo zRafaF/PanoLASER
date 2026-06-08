@@ -21,7 +21,6 @@ base_model_wrapper = PanoVGGTExtractor()
 vanilla_engine = PanoVanillaEngine(base_model_wrapper.model)
 streaming_engine = StreamingWindowEngine(vanilla_engine, window_size=16, overlap=4)
 
-# Global state to pass data from the SLAM step to the Texture Baking step
 backend_state = {
     "frames": [],
     "mesh": None
@@ -146,9 +145,11 @@ def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
     if not files: return "⚠️ No valid images found."
     return f"✅ Total files to process: {len(files)}\n\n" + "\n".join(f"{i + 1}. {os.path.basename(n)}" for i, n in enumerate(files))
 
+# --- THE FIX: ADDING THE NEW PARAMETERS ---
 def process_sequence_ui(
     input_mode, uploaded_files, local_dir, decimation,
-    zenith_limit, nadir_limit, target_width, target_height, window_size, overlap
+    zenith_limit, nadir_limit, target_width, target_height, 
+    window_size, overlap, max_depth, voxel_size, keyframe_dist
 ):
     file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
     if not file_paths or len(file_paths) < 2:
@@ -160,11 +161,14 @@ def process_sequence_ui(
         frames.append(img_np)
         masks.append(get_spherical_valid_mask(img_np.shape[0], img_np.shape[1], zenith_deg=zenith_limit, nadir_deg=nadir_limit))
 
-    # Save frames to global state for the texture baker later
     backend_state["frames"] = frames
     
+    # Inject all the fine-tuning parameters!
     streaming_engine.window_size = int(window_size)
     streaming_engine.overlap = int(overlap)
+    streaming_engine.max_depth = float(max_depth)
+    streaming_engine.voxel_size = float(voxel_size)
+    streaming_engine.min_translation_m = float(keyframe_dist)
 
     for mesh, global_pcd, trajectory, lc_edges in streaming_engine.process_sequence(frames, masks):
         fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, lc_edges)
@@ -173,7 +177,7 @@ def process_sequence_ui(
         if mesh is None or len(mesh.vertices) == 0:
             yield fig, pcd_path, None, None, gr.update(interactive=False)
         else:
-            backend_state["mesh"] = mesh # Save the final geometry
+            backend_state["mesh"] = mesh
             mesh_path = save_mesh_to_glb(mesh, "final_scene")
             yield fig, pcd_path, mesh_path, mesh_path, gr.update(interactive=True)
 
@@ -181,24 +185,18 @@ def run_texture_optimization():
     if backend_state["mesh"] is None or len(backend_state["frames"]) == 0:
         raise gr.Error("You must run SLAM on a sequence first!")
         
-    gr.Info("Starting UV mapping and texture projection. This might take a few minutes...")
+    gr.Info("Starting GPU Raycasting and topology enhancement...")
     
-    # Grab the exact frames that were assigned a 4x4 matrix
     used_frames = [backend_state["frames"][idx] for idx in streaming_engine.processed_indices]
     used_poses = streaming_engine.full_poses
     
-    baker = HighResTextureBaker(face_size=1024)
+    baker = HighResTextureBaker(device="cuda") 
     textured_mesh = baker.run_baking_pass(backend_state["mesh"], used_frames, used_poses)
     
-    # Save the output
     temp_dir = tempfile.mkdtemp()
     obj_path = os.path.join(temp_dir, "high_res_scene.obj")
-    
     o3d.io.write_triangle_mesh(obj_path, textured_mesh, write_triangle_uvs=True)
-    
-    # Zip it up so the user downloads the .obj + .mtl + .png maps together
     zip_path = shutil.make_archive(os.path.join(temp_dir, "HighRes_Map"), 'zip', temp_dir)
-    
     return obj_path, zip_path
 
 def toggle_input_mode(mode):
@@ -227,6 +225,12 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
             gr.Markdown("### Submap Configuration (SLAM)")
             window_size_slider = gr.Slider(minimum=3, maximum=32, value=16, step=1, label="Submap Window Size")
             overlap_slider = gr.Slider(minimum=2, maximum=8, value=4, step=1, label="Submap Overlap")
+            
+            # --- THE FIX: NEW TUNING SLIDERS ---
+            gr.Markdown("### 🧠 Nvblox Dense GPU Parameters")
+            voxel_size_slider = gr.Slider(minimum=0.01, maximum=0.10, value=0.02, step=0.01, label="Voxel Resolution (m) [Lower = Denser]")
+            max_depth_slider = gr.Slider(minimum=2.0, maximum=15.0, value=4.5, step=0.5, label="Max Depth Ray Cutoff (m)")
+            keyframe_dist_slider = gr.Slider(minimum=0.05, maximum=1.0, value=0.10, step=0.05, label="Keyframe Stamp Distance (m)")
 
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -259,7 +263,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
                             output_mesh = gr.Model3D(label="Real-Time TSDF Mesh")
                             download_mesh = gr.File(label="💾 Download Mesh .glb")
                         with gr.Tab("High-Res Texture Bake"):
-                            gr.Markdown("When the sequence finishes, click here to run a rigid color-map optimizer. This projects the 4K raw panoramas onto the mesh to generate a UV texture atlas.")
+                            gr.Markdown("Run Pure PyTorch Raycasting to paint ultra-dense topologies.")
                             optimize_tex_btn = gr.Button("Bake High-Res Textures", variant="primary", interactive=False)
                             output_highres_mesh = gr.Model3D(label="Textured Mesh Preview")
                             download_highres_zip = gr.File(label="💾 Download ZIP (OBJ + Textures)")
@@ -277,7 +281,11 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
 
     run_seq_btn.click(
         fn=process_sequence_ui,
-        inputs=[input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, target_width, target_height, window_size_slider, overlap_slider],
+        inputs=[
+            input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, 
+            target_width, target_height, window_size_slider, overlap_slider, 
+            max_depth_slider, voxel_size_slider, keyframe_dist_slider # <--- ALL SLIDERS LINKED
+        ],
         outputs=[output_3d_seq, download_seq, output_mesh, download_mesh, optimize_tex_btn]
     )
     

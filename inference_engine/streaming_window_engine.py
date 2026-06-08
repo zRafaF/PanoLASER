@@ -19,13 +19,17 @@ class StreamingWindowEngine:
         
         self.target_camera_height = 1.7 
         self.vram_tracker = VRAMProfiler()
-        self.max_depth = 5.0
+        
+        # User Mutable Tuning Parameters
+        self.max_depth = 4.5
+        self.voxel_size = 0.02
+        self.min_translation_m = 0.10
         
         self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
         self.tsdf_future = None
         self.tsdf = None
         
-        print("[Engine] Initializing C++ Nvblox Keyframe Engine...")
+        print("[Engine] Initializing Dynamic C++ Nvblox Keyframe Engine...")
         self.reset()
         
     def reset(self):
@@ -36,7 +40,7 @@ class StreamingWindowEngine:
         self.last_mesh = None
         self.last_pcd = None
             
-        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.05, max_depth=self.max_depth, crop_margin=24, device=self.device)
+        self.tsdf = NvbloxPanoTSDF(voxel_size_m=self.voxel_size, max_depth=self.max_depth, crop_margin=24, device=self.device)
         
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
@@ -49,9 +53,7 @@ class StreamingWindowEngine:
         self.is_first_window = True
         self.current_metric_scale = 1.0
         
-        # --- NEW: Spatial Keyframing Tracker ---
         self.last_integrated_position = None
-        self.min_translation_m = 0.25  # Only integrate into TSDF if moved 25cm
 
     def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
         for j in range(len(poses)):
@@ -99,7 +101,6 @@ class StreamingWindowEngine:
             if self.is_first_window:
                 if floor_scale is not None:
                     self.current_metric_scale = floor_scale
-                    print(f"  > [Metric] Floor Detected | Conf: {floor_conf:.2f} | Scale: {floor_scale:.3f}")
                 else:
                     first_depth = np.linalg.norm(pts_list[0], axis=-1)
                     valid_depths = first_depth[first_depth > 0.1]
@@ -149,7 +150,6 @@ class StreamingWindowEngine:
                     self.processed_indices.append(i + j)
                     self.full_poses.append(global_pose)
                     
-                    # --- NEW: Spatial Keyframing Logic ---
                     should_integrate = False
                     if self.last_integrated_position is None:
                         should_integrate = True
@@ -189,7 +189,6 @@ class StreamingWindowEngine:
                 )
             profiler["Nvblox_Enqueue"] = time.time() - t3
             
-            # --- Profiling & VRAM Output ---
             avg_alloc, max_alloc, avg_res, max_res = self.vram_tracker.stop()
             total_time = time.time() - t_win_start
             
@@ -203,7 +202,6 @@ class StreamingWindowEngine:
 
             self.submap_count += 1
             
-            # Live UI Update 
             if self.submap_count % 3 == 0:
                 self.last_mesh = self.tsdf.extract_mesh()
                 self.last_pcd = o3d.geometry.PointCloud()
