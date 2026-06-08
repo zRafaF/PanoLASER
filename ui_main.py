@@ -148,7 +148,8 @@ def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
 
 def process_sequence_ui(
     input_mode, uploaded_files, local_dir, decimation,
-    zenith_limit, nadir_limit, target_width, target_height, window_size, overlap
+    zenith_limit, nadir_limit, target_width, target_height, window_size, overlap,
+    max_depth
 ):
     file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
     if not file_paths or len(file_paths) < 2:
@@ -165,6 +166,7 @@ def process_sequence_ui(
     
     streaming_engine.window_size = int(window_size)
     streaming_engine.overlap = int(overlap)
+    streaming_engine.max_depth = float(max_depth)
 
     for mesh, global_pcd, trajectory, lc_edges in streaming_engine.process_sequence(frames, masks):
         fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, lc_edges)
@@ -187,8 +189,8 @@ def run_texture_optimization():
     used_frames = [backend_state["frames"][idx] for idx in streaming_engine.processed_indices]
     used_poses = streaming_engine.full_poses
     
-    baker = HighResTextureBaker(face_size=1024)
-    textured_mesh = baker.run_baking_pass(backend_state["mesh"], used_frames, used_poses)
+    baker = HighResTextureBaker(device="cuda") 
+    textured_mesh = baker.run_baking_pass(backend_state["mesh"], used_frames, used_poses)    
     
     # Save the output
     temp_dir = tempfile.mkdtemp()
@@ -227,6 +229,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
             gr.Markdown("### Submap Configuration (SLAM)")
             window_size_slider = gr.Slider(minimum=3, maximum=32, value=16, step=1, label="Submap Window Size")
             overlap_slider = gr.Slider(minimum=2, maximum=8, value=4, step=1, label="Submap Overlap")
+            max_depth_slider = gr.Slider(minimum=2.0, maximum=15.0, value=5.0, step=0.5, label="Max Depth Cutoff (m)")
 
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -277,7 +280,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
 
     run_seq_btn.click(
         fn=process_sequence_ui,
-        inputs=[input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, target_width, target_height, window_size_slider, overlap_slider],
+        inputs=[input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, target_width, target_height, window_size_slider, overlap_slider, max_depth_slider],
         outputs=[output_3d_seq, download_seq, output_mesh, download_mesh, optimize_tex_btn]
     )
     
