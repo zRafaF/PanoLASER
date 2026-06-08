@@ -171,13 +171,34 @@ class StreamingWindowEngine:
                 print(f"    - {k:<30}: {v:.4f} sec")
             print(f"  >>> Total Cycle Time: {total_time:.4f} sec")
             
-            # Yield empty placeholders to keep outer loops/visualization alive,
-            # as computing the mesh every frame would bottleneck the streaming logic.
-            empty_mesh = o3d.geometry.TriangleMesh()
-            empty_pcd = o3d.geometry.PointCloud()
-            yield empty_mesh, empty_pcd, np.array(self.trajectory), []
+            # --- THE FIX: Safe Yields for Gradio & Open3D ---
+            safe_pcd = o3d.geometry.PointCloud()
+            safe_mesh = o3d.geometry.TriangleMesh()
+            
+            # Update the UI with the real mesh every 3 windows so the user isn't blind
+            if self.submap_count % 3 == 0:
+                safe_mesh = self.tsdf.extract_mesh()
+                safe_pcd.points = safe_mesh.vertices
+                if safe_mesh.has_vertex_colors():
+                    safe_pcd.colors = safe_mesh.vertex_colors
 
-        # Await final integration chunk
+            # Fallback to prevent Open3D from failing to write a 0-point file
+            if len(safe_pcd.points) == 0:
+                # Yield the camera trajectory as a point cloud so the UI shows movement
+                if len(self.trajectory) > 0:
+                    safe_pcd.points = o3d.utility.Vector3dVector(np.array(self.trajectory))
+                    safe_pcd.paint_uniform_color([1.0, 0.0, 0.0]) # Red trajectory line
+                else:
+                    safe_pcd.points = o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0]]))
+                
+                # Give the mesh a microscopic hidden triangle
+                safe_mesh.vertices = o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.0, 0.001, 0.0]]))
+                safe_mesh.triangles = o3d.utility.Vector3iVector(np.array([[0, 1, 2]]))
+
+            yield safe_mesh, safe_pcd, np.array(self.trajectory), []
+
+        # ==========================================
+        # Await final integration chunk at sequence end
         if self.tsdf_future is not None:
             self.tsdf_future.result()
 
