@@ -31,7 +31,7 @@ class StreamingWindowEngine:
             self.tsdf_future = None
             
         # Initialize Global TSDF Mapper ONCE
-        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.01, max_depth=3.5, crop_margin=24, device=self.device)
+        self.tsdf = NvbloxPanoTSDF(voxel_size_m=0.07, max_depth=4.5, crop_margin=24, device=self.device)
         
         self.prev_overlap_raw_pts = []
         self.prev_overlap_global_poses = []
