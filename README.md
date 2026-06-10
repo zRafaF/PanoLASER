@@ -146,7 +146,7 @@ wget https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt -O checkpoi
 
 apt-get update && apt-get install -y git-lfs cmake build-essential python3-dev
 git lfs install
-git clone -b v0.0.10 https://github.com/nvidia-isaac/nvblox.git
+git clone -b v0.0.10 https://github.com/zRafaF/nvblox.git
 cd nvblox
 source ../.venv/bin/activate
 
