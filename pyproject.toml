@@ -47,6 +47,8 @@ dependencies = [
     "gtsam>=4.2.1; sys_platform == 'linux'", # Safely ignores Windows dev locks
     "pytorch-metric-learning>=2.9.0",
     "pytorch-lightning>=2.6.5",
+    "gsplat>=1.5.3",
+    "viser>=1.0.30",
 ]
 
 [[tool.uv.index]]
