@@ -11,19 +11,16 @@ class PanoGaussianMapper(nn.Module):
         self.device = torch.device(device)
         self.face_size = face_size
         
-        # Gaussian Parameters
         self.means = nn.Parameter(torch.empty((0, 3), device=self.device))
         self.scales = nn.Parameter(torch.empty((0, 3), device=self.device))
         self.quats = nn.Parameter(torch.empty((0, 4), device=self.device))
         self.opacities = nn.Parameter(torch.empty((0,), device=self.device))
-        self.colors = nn.Parameter(torch.empty((0, 3), device=self.device)) # Base RGB (SH0)
+        self.colors = nn.Parameter(torch.empty((0, 3), device=self.device)) 
         
         self.optimizer = None
         self._precompute_cubemap_cameras()
         
     def _precompute_cubemap_cameras(self):
-        """Generates the 6 Pinhole Cameras for a 360 Panorama"""
-        # 90-degree FOV pinhole math
         focal = self.face_size / 2.0
         c = self.face_size / 2.0
         self.K = torch.tensor([
@@ -32,19 +29,18 @@ class PanoGaussianMapper(nn.Module):
             [0, 0, 1]
         ], device=self.device, dtype=torch.float32)
         
-        # Grid sample coordinates for Equirectangular -> Cubemap extraction
         u = torch.linspace(-1, 1, self.face_size, device=self.device)
         v = torch.linspace(-1, 1, self.face_size, device=self.device)
         v_grid, u_grid = torch.meshgrid(v, u, indexing='ij')
         base_rays = torch.stack([u_grid, v_grid, torch.ones_like(u_grid)], dim=-1)
         
         self.face_rotations = [
-            torch.tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]], device=self.device, dtype=torch.float32),  # Front
-            torch.tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], device=self.device, dtype=torch.float32), # Right
-            torch.tensor([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], device=self.device, dtype=torch.float32),# Back
-            torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]], device=self.device, dtype=torch.float32), # Left
-            torch.tensor([[-1, 0, 0], [0, 0, -1], [0, -1, 0]], device=self.device, dtype=torch.float32),# Top
-            torch.tensor([[-1, 0, 0], [0, 0, 1], [0, 1, 0]], device=self.device, dtype=torch.float32), # Bottom
+            torch.tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]], device=self.device, dtype=torch.float32), 
+            torch.tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], device=self.device, dtype=torch.float32), 
+            torch.tensor([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], device=self.device, dtype=torch.float32),
+            torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]], device=self.device, dtype=torch.float32), 
+            torch.tensor([[-1, 0, 0], [0, 0, -1], [0, -1, 0]], device=self.device, dtype=torch.float32),
+            torch.tensor([[-1, 0, 0], [0, 0, 1], [0, 1, 0]], device=self.device, dtype=torch.float32), 
         ]
         
         grids = []
@@ -59,7 +55,6 @@ class PanoGaussianMapper(nn.Module):
 
     @torch.no_grad()
     def seed_new_points(self, points_np, colors_np):
-        """Adds new VGGT points to the Gaussian map"""
         num_new = points_np.shape[0]
         if num_new == 0: return
         
@@ -67,62 +62,45 @@ class PanoGaussianMapper(nn.Module):
         new_colors = torch.from_numpy(colors_np).float().to(self.device)
         
         dist_to_origin = torch.norm(new_means, dim=1, keepdim=True)
-        
-        # 3. SHRINK INITIAL SCALES
-        # Changed from 0.01 to 0.003. 
-        # This forces the Gaussians to start as tiny, sharp points. They will only 
-        # grow into "blocks" if the optimizer absolutely needs them to fill a void.
+        # Small initialization so optimizer has to work to expand them
         new_scales = torch.log(torch.clamp(dist_to_origin * 0.003, min=0.0005)).repeat(1, 3) 
         
         new_quats = torch.zeros((num_new, 4), device=self.device)
         new_quats[:, 0] = 1.0 
         
-        # Start opacities at 0.5 (logit scale)
         new_opacities = torch.zeros((num_new,), device=self.device) 
         
-        # Concatenate with existing state
         self.means = nn.Parameter(torch.cat([self.means, new_means], dim=0))
         self.scales = nn.Parameter(torch.cat([self.scales, new_scales], dim=0))
         self.quats = nn.Parameter(torch.cat([self.quats, new_quats], dim=0))
         self.opacities = nn.Parameter(torch.cat([self.opacities, new_opacities], dim=0))
         self.colors = nn.Parameter(torch.cat([self.colors, new_colors], dim=0))
         
-        # 4. OPTIMIZER LEARNING RATE TWEAK
-        # Since we are running more iterations, we lower the scale/opacity learning 
-        # rates slightly to prevent the Gaussians from aggressively blowing up.
         self.optimizer = torch.optim.Adam([
             {'params': [self.means], 'lr': 0.0001},
             {'params': [self.colors], 'lr': 0.01},
-            {'params': [self.scales, self.quats], 'lr': 0.002}, # Lowered from 0.005
-            {'params': [self.opacities], 'lr': 0.02}            # Lowered from 0.05
+            {'params': [self.scales, self.quats], 'lr': 0.002}, 
+            {'params': [self.opacities], 'lr': 0.02}            
         ])
 
     def train_submap(self, batch_rgbs, batch_poses, iterations=15):
-        """Runs fast gradient descent to align Gaussians with the panoramic RGBs"""
         if self.means.shape[0] == 0: return
         
         self.train()
-        
-        # Prepare GT Cubemaps on GPU
         gt_cubemaps = []
         viewmats = []
         
         with torch.no_grad():
             for rgb, pose in zip(batch_rgbs, batch_poses):
-                # 1. Image to GPU
                 img_t = torch.from_numpy(rgb).float().to(self.device) / 255.0
                 img_t = img_t.permute(2, 0, 1).unsqueeze(0)
                 
-                # 2. Extract 6 faces (Ignoring Top/Bottom poles for training stability)
                 faces = []
-                for i in range(4): # Just train on Front, Right, Back, Left
+                for i in range(4): 
                     face = F.grid_sample(img_t, self.batched_grids[i:i+1], mode='bilinear', align_corners=False)
-                    faces.append(face.squeeze(0).permute(1, 2, 0)) # (H, W, 3)
+                    faces.append(face.squeeze(0).permute(1, 2, 0)) 
                     
-                    # 3. Calculate View Matrix (Extrinsics) for each face
-                    # FIX: Explicitly cast the NumPy pose array to a PyTorch GPU Tensor
                     pose_t = torch.from_numpy(pose).float().to(self.device)
-                    
                     R_c_w = pose_t[:3, :3].T
                     t_c_w = -R_c_w @ pose_t[:3, 3]
                     
@@ -133,44 +111,29 @@ class PanoGaussianMapper(nn.Module):
                     
                 gt_cubemaps.extend(faces)
                 
-        viewmats = torch.stack(viewmats) # (N*4, 4, 4)
+        viewmats = torch.stack(viewmats) 
         K_batched = self.K.unsqueeze(0).expand(len(viewmats), -1, -1)
         
-        # Training Loop
         for step in range(iterations):
             self.optimizer.zero_grad()
-            
-            # gsplat 1.0+ Rasterization
             renders, _, _ = rasterization(
-                means=self.means,
-                quats=self.quats,
-                scales=torch.exp(self.scales),
-                opacities=torch.sigmoid(self.opacities),
-                colors=torch.sigmoid(self.colors),
-                viewmats=viewmats,
-                Ks=K_batched,
-                width=self.face_size,
-                height=self.face_size,
-                packed=False
+                means=self.means, quats=self.quats, scales=torch.exp(self.scales),
+                opacities=torch.sigmoid(self.opacities), colors=torch.sigmoid(self.colors),
+                viewmats=viewmats, Ks=K_batched, width=self.face_size, height=self.face_size, packed=False
             )
             
-            # Compute L1 Loss against Ground Truth
             loss = 0.0
-            for r_img, gt_img in zip(renders, gt_cubemaps):
-                loss += F.l1_loss(r_img, gt_img)
-                
+            for r_img, gt_img in zip(renders, gt_cubemaps): loss += F.l1_loss(r_img, gt_img)
             loss = loss / len(renders)
             loss.backward()
             self.optimizer.step()
             
     @torch.no_grad()
     def get_o3d_pointcloud(self):
-        """Extracts current Gaussian Means as a dense point cloud for Gradio UI"""
         pcd = o3d.geometry.PointCloud()
         if self.means.shape[0] == 0: return pcd
-        
-        # Filter out completely invisible Gaussians
-        valid_mask = torch.sigmoid(self.opacities) > 0.1
+        valid_mask = torch.sigmoid(self.opacities) > 0.05
+        if valid_mask.sum() == 0: return pcd
         
         pcd.points = o3d.utility.Vector3dVector(self.means[valid_mask].cpu().numpy())
         pcd.colors = o3d.utility.Vector3dVector(torch.sigmoid(self.colors[valid_mask]).cpu().numpy())
@@ -178,60 +141,34 @@ class PanoGaussianMapper(nn.Module):
 
     @torch.no_grad()
     def save_ply(self, path):
-        """Exports standard 3DGS .ply for WebGL viewers (SuperSplat, PlayCanvas)"""
         import plyfile
-        
-        if self.means.shape[0] == 0:
-            print("No Gaussians to save.")
-            return
+        if self.means.shape[0] == 0: return
 
-        # 1. Filter out completely invisible or dead Gaussians
         valid_mask = torch.sigmoid(self.opacities) > 0.05
-        
         xyz = self.means[valid_mask].cpu().numpy()
         normals = np.zeros_like(xyz)
         
-        # 2. Convert Sigmoid Colors back to Spherical Harmonics (SH0)
-        # Standard 3DGS viewers expect colors as SH coefficients, not 0-1 RGB.
         rgb = torch.sigmoid(self.colors[valid_mask]).cpu().numpy()
         f_dc = (rgb - 0.5) / 0.28209479177387814
         
-        # 3. Extract properties (already in the correct Log / Logit space for viewers)
         opacities = self.opacities[valid_mask].unsqueeze(-1).cpu().numpy()
         scales = self.scales[valid_mask].cpu().numpy()
-        
-        # 4. Normalize Quaternions (W, X, Y, Z)
         quats = F.normalize(self.quats[valid_mask], p=2, dim=-1).cpu().numpy()
         
-        # 5. Construct the strict binary structure expected by 3DGS viewers
         dtype_full = [
-            ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
-            ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
-            ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4'),
-            ('opacity', 'f4'),
+            ('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+            ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4'), ('opacity', 'f4'),
             ('scale_0', 'f4'), ('scale_1', 'f4'), ('scale_2', 'f4'),
             ('rot_0', 'f4'), ('rot_1', 'f4'), ('rot_2', 'f4'), ('rot_3', 'f4')
         ]
         
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        elements['x'] = xyz[:, 0]
-        elements['y'] = xyz[:, 1]
-        elements['z'] = xyz[:, 2]
-        elements['nx'] = normals[:, 0]
-        elements['ny'] = normals[:, 1]
-        elements['nz'] = normals[:, 2]
-        elements['f_dc_0'] = f_dc[:, 0]
-        elements['f_dc_1'] = f_dc[:, 1]
-        elements['f_dc_2'] = f_dc[:, 2]
+        elements['x'], elements['y'], elements['z'] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        elements['nx'], elements['ny'], elements['nz'] = normals[:, 0], normals[:, 1], normals[:, 2]
+        elements['f_dc_0'], elements['f_dc_1'], elements['f_dc_2'] = f_dc[:, 0], f_dc[:, 1], f_dc[:, 2]
         elements['opacity'] = opacities[:, 0]
-        elements['scale_0'] = scales[:, 0]
-        elements['scale_1'] = scales[:, 1]
-        elements['scale_2'] = scales[:, 2]
-        elements['rot_0'] = quats[:, 0]
-        elements['rot_1'] = quats[:, 1]
-        elements['rot_2'] = quats[:, 2]
-        elements['rot_3'] = quats[:, 3]
+        elements['scale_0'], elements['scale_1'], elements['scale_2'] = scales[:, 0], scales[:, 1], scales[:, 2]
+        elements['rot_0'], elements['rot_1'], elements['rot_2'], elements['rot_3'] = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
         
         el = plyfile.PlyElement.describe(elements, 'vertex')
         plyfile.PlyData([el]).write(path)
-        print(f"✅ Saved True Gaussian Splat map with {xyz.shape[0]} splats to {path}")
