@@ -62,12 +62,10 @@ class PanoGaussianMapper(nn.Module):
         new_colors = torch.from_numpy(colors_np).float().to(self.device)
         
         dist_to_origin = torch.norm(new_means, dim=1, keepdim=True)
-        # Small initialization so optimizer has to work to expand them
         new_scales = torch.log(torch.clamp(dist_to_origin * 0.003, min=0.0005)).repeat(1, 3) 
         
         new_quats = torch.zeros((num_new, 4), device=self.device)
         new_quats[:, 0] = 1.0 
-        
         new_opacities = torch.zeros((num_new,), device=self.device) 
         
         self.means = nn.Parameter(torch.cat([self.means, new_means], dim=0))
@@ -85,8 +83,8 @@ class PanoGaussianMapper(nn.Module):
 
     def train_submap(self, batch_rgbs, batch_poses, iterations=15):
         if self.means.shape[0] == 0: return
-        
         self.train()
+        
         gt_cubemaps = []
         viewmats = []
         
@@ -127,6 +125,67 @@ class PanoGaussianMapper(nn.Module):
             loss = loss / len(renders)
             loss.backward()
             self.optimizer.step()
+
+    @torch.no_grad()
+    def garbage_collect(self, batch_depths, batch_masks, batch_poses):
+        """
+        SOTA Z-Buffer Frustum Culling. 
+        Obliterates dynamic objects and ghosts without relying on a TSDF Voxel Grid.
+        """
+        if self.means.shape[0] == 0: return 0
+
+        valid_mask = torch.sigmoid(self.opacities) > 0.05
+        active_means = self.means[valid_mask]
+        active_indices = torch.nonzero(valid_mask).squeeze()
+
+        if len(active_means) == 0: return 0
+
+        total_killed = 0
+        for depth_np, mask_np, pose_np in zip(batch_depths, batch_masks, batch_poses):
+            if len(active_means) == 0: break
+
+            depth_t = torch.from_numpy(depth_np).float().to(self.device)
+            mask_t = torch.from_numpy(mask_np).float().to(self.device)
+            pose_t = torch.from_numpy(pose_np).float().to(self.device)
+
+            R_w_c = pose_t[:3, :3]
+            t_w_c = pose_t[:3, 3]
+
+            V_c = (active_means - t_w_c) @ R_w_c
+            X, Y, Z = V_c[:, 0], V_c[:, 1], V_c[:, 2]
+
+            dist = torch.sqrt(X**2 + Y**2 + Z**2)
+
+            theta = torch.atan2(X, Z)
+            phi = torch.asin(torch.clamp(Y / (dist + 1e-6), -1.0, 1.0))
+            u_norm = theta / torch.pi
+            v_norm = phi / (torch.pi / 2.0)
+
+            grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0)
+
+            sampled_depths = torch.nn.functional.grid_sample(
+                depth_t.unsqueeze(0).unsqueeze(0), grid, mode='nearest', align_corners=False
+            ).squeeze()
+
+            sampled_masks = torch.nn.functional.grid_sample(
+                mask_t.unsqueeze(0).unsqueeze(0), grid, mode='nearest', align_corners=False
+            ).squeeze()
+
+            # THE CULLING HEURISTIC:
+            # If the Gaussian is >25cm closer to the camera than the wall the camera currently sees,
+            # the Gaussian is floating in thin air. It is a ghost. Kill it.
+            is_ghost = (dist > 0.1) & (sampled_masks > 0.5) & ((dist + 0.25) < sampled_depths)
+
+            if is_ghost.any():
+                ghost_indices = active_indices[is_ghost]
+                self.opacities.data[ghost_indices] = -10.0 # Force opacity to 0%
+                total_killed += int(is_ghost.sum().item())
+
+                # Prune lists so we don't re-check dead Gaussians
+                active_means = active_means[~is_ghost]
+                active_indices = active_indices[~is_ghost]
+
+        return total_killed
             
     @torch.no_grad()
     def get_o3d_pointcloud(self):
