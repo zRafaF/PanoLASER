@@ -148,7 +148,7 @@ apt-get update && apt-get install -y git-lfs cmake build-essential python3-dev
 git lfs install
 git clone -b v0.0.10 https://github.com/nvidia-isaac/nvblox.git
 cd nvblox
-source /root/PanoLASER/.venv/bin/activate
+source ../.venv/bin/activate
 
 mkdir build && cd build
 cmake .. -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch.utils; print(torch.utils.cmake_prefix_path)')" -DBUILD_RENDERER=0
@@ -156,10 +156,11 @@ cmake .. -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch.utils; print(torch.util
 make -j$(nproc)
 cd ../nvblox_torch
 uv pip install --editable .
+cd ../../
 
 
 
 
 ##### PATH
-/root/PanoLASER/examples/resize
+/root/PanoLASER/examples/resized
 ```
