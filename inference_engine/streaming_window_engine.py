@@ -66,10 +66,6 @@ class StreamingWindowEngine:
 
     @torch.no_grad()
     def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_depths, batch_masks, batch_poses):
-        """
-        Projects mesh vertices back into panoramic keyframes.
-        Features: Distance Attenuation, Z-Buffer Occlusion, Lens Confidence, and Anti-Smear.
-        """
         num_pts = vertices_np.shape[0]
         if num_pts == 0 or len(batch_rgbs) == 0:
             return np.zeros((num_pts, 3))
@@ -102,16 +98,12 @@ class StreamingWindowEngine:
             
             grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0) 
 
-            # align_corners=False prevents bleeding from the opposite side of the 360 wrap
             sampled_colors = torch.nn.functional.grid_sample(img_t, grid, mode='bilinear', align_corners=False).squeeze().T
             sampled_depths = torch.nn.functional.grid_sample(depth_t, grid, mode='nearest', align_corners=False).squeeze()
             sampled_masks = torch.nn.functional.grid_sample(mask_t, grid, mode='nearest', align_corners=False).squeeze()
 
             valid_mask_hit = sampled_masks > 0.5
-            
-            # Tightened to > 0.15 to ensure bilinear bleeding of the black tripod edge is discarded entirely
             is_not_black = sampled_colors.sum(dim=1) > 0.15
-            
             depth_tolerance = 0.15 
             is_visible = dist <= (sampled_depths + depth_tolerance)
 
@@ -243,7 +235,6 @@ class StreamingWindowEngine:
                         scaled_pts = pts_list[j] * self.current_metric_scale
                         depth_map = np.linalg.norm(scaled_pts, axis=-1)
                         
-                        # CRITICAL: Sanitize Depth Map to prevent C++ Nvblox Hash Allocation crashes
                         depth_map = np.nan_to_num(depth_map, nan=0.0, posinf=0.0, neginf=0.0)
                         
                         batch_depths.append(depth_map)
@@ -287,11 +278,21 @@ class StreamingWindowEngine:
             self.submap_count += 1
             
             if self.submap_count % 3 == 0:
+                
+                # ==============================================================
+                # CRITICAL RACE-CONDITION FIX:
+                # We MUST wait for the background integration thread to finish
+                # BEFORE we ask the GPU to extract the mesh. Otherwise they both
+                # try to access/resize the Hash Map memory at the exact same time.
+                # ==============================================================
+                if self.tsdf_future is not None:
+                    self.tsdf_future.result()
+                    self.tsdf_future = None
+                    
                 self.last_mesh = self.tsdf.extract_mesh()
                 
                 if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
                     t_color_start = time.time()
-                    
                     self.last_mesh.compute_vertex_normals()
                     
                     colored_vertices = self._apply_pytorch_colors(
