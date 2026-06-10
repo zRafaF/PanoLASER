@@ -287,6 +287,41 @@ class StreamingWindowEngine:
                 )
             profiler["Nvblox_Enqueue"] = time.time() - t3
             
+            # --- Meshing & Coloring Block ---
+            t4 = time.time()
+            if self.submap_count % 3 == 0:
+                # Lock background thread before requesting geometry
+                if self.tsdf_future is not None:
+                    self.tsdf_future.result()
+                    self.tsdf_future = None
+                    
+                self.last_mesh = self.tsdf.extract_mesh()
+                
+                if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
+                    self.last_mesh.compute_vertex_normals()
+                    
+                    colored_vertices = self._apply_pytorch_colors(
+                        np.asarray(self.last_mesh.vertices),
+                        np.asarray(self.last_mesh.vertex_normals),
+                        self.kf_rgbs,
+                        self.kf_depths,
+                        self.kf_masks,
+                        self.kf_poses
+                    )
+                    
+                    self.last_mesh.vertex_colors = o3d.utility.Vector3dVector(colored_vertices)
+
+                self.last_pcd = o3d.geometry.PointCloud()
+                if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
+                    valid_color_mask = colored_vertices.sum(axis=1) > 0.0
+                    filtered_points = np.asarray(self.last_mesh.vertices)[valid_color_mask]
+                    filtered_colors = colored_vertices[valid_color_mask]
+                    
+                    self.last_pcd.points = o3d.utility.Vector3dVector(filtered_points)
+                    self.last_pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
+            profiler["Meshing_&_Coloring"] = time.time() - t4
+
+            # --- Profiler Output ---
             pt_alloc, pt_res, sys_used, sys_total = self.vram_tracker.stop()
             total_time = time.time() - t_win_start
             
@@ -300,40 +335,6 @@ class StreamingWindowEngine:
             print(f"    - True System VRAM   : {sys_used:.2f} GB / {sys_total:.2f} GB")
 
             self.submap_count += 1
-            
-            if self.submap_count % 3 == 0:
-                # Lock background thread before requesting geometry
-                if self.tsdf_future is not None:
-                    self.tsdf_future.result()
-                    self.tsdf_future = None
-                    
-                self.last_mesh = self.tsdf.extract_mesh()
-                
-                if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
-                    t_color_start = time.time()
-                    self.last_mesh.compute_vertex_normals()
-                    
-                    colored_vertices = self._apply_pytorch_colors(
-                        np.asarray(self.last_mesh.vertices),
-                        np.asarray(self.last_mesh.vertex_normals),
-                        self.kf_rgbs,
-                        self.kf_depths,
-                        self.kf_masks,
-                        self.kf_poses
-                    )
-                    
-                    self.last_mesh.vertex_colors = o3d.utility.Vector3dVector(colored_vertices)
-                    print(f"  > [Coloring] PyTorch Raycasting applied to {len(self.last_mesh.vertices)} vertices in {time.time() - t_color_start:.4f} sec")
-
-                self.last_pcd = o3d.geometry.PointCloud()
-                if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
-                    # Filter out unpainted vertices so they don't look like floating dust
-                    valid_color_mask = colored_vertices.sum(axis=1) > 0.0
-                    filtered_points = np.asarray(self.last_mesh.vertices)[valid_color_mask]
-                    filtered_colors = colored_vertices[valid_color_mask]
-                    
-                    self.last_pcd.points = o3d.utility.Vector3dVector(filtered_points)
-                    self.last_pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
 
             yield_mesh = self.last_mesh
             yield_pcd = self.last_pcd
@@ -353,6 +354,7 @@ class StreamingWindowEngine:
 
             yield yield_mesh, yield_pcd, np.array(self.trajectory), []
 
+        # --- Final Sequence Extraction ---
         if self.tsdf_future is not None:
             self.tsdf_future.result()
 
