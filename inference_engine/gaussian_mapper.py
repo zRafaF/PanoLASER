@@ -66,15 +66,18 @@ class PanoGaussianMapper(nn.Module):
         new_means = torch.from_numpy(points_np).float().to(self.device)
         new_colors = torch.from_numpy(colors_np).float().to(self.device)
         
-        # Initialize small isotropic scales and default opacities
         dist_to_origin = torch.norm(new_means, dim=1, keepdim=True)
-        # Scale heuristic: 1% of distance to camera, roughly representing point footprint
-        new_scales = torch.log(torch.clamp(dist_to_origin * 0.01, min=0.001)).repeat(1, 3) 
+        
+        # 3. SHRINK INITIAL SCALES
+        # Changed from 0.01 to 0.003. 
+        # This forces the Gaussians to start as tiny, sharp points. They will only 
+        # grow into "blocks" if the optimizer absolutely needs them to fill a void.
+        new_scales = torch.log(torch.clamp(dist_to_origin * 0.003, min=0.0005)).repeat(1, 3) 
         
         new_quats = torch.zeros((num_new, 4), device=self.device)
-        new_quats[:, 0] = 1.0 # Identity quaternion (W, X, Y, Z)
+        new_quats[:, 0] = 1.0 
         
-        # Start opacities at 0.5 (logit scale: inv_sigmoid(0.5) = 0)
+        # Start opacities at 0.5 (logit scale)
         new_opacities = torch.zeros((num_new,), device=self.device) 
         
         # Concatenate with existing state
@@ -84,12 +87,14 @@ class PanoGaussianMapper(nn.Module):
         self.opacities = nn.Parameter(torch.cat([self.opacities, new_opacities], dim=0))
         self.colors = nn.Parameter(torch.cat([self.colors, new_colors], dim=0))
         
-        # Re-initialize Adam with new parameter shapes
+        # 4. OPTIMIZER LEARNING RATE TWEAK
+        # Since we are running more iterations, we lower the scale/opacity learning 
+        # rates slightly to prevent the Gaussians from aggressively blowing up.
         self.optimizer = torch.optim.Adam([
             {'params': [self.means], 'lr': 0.0001},
             {'params': [self.colors], 'lr': 0.01},
-            {'params': [self.scales, self.quats], 'lr': 0.005},
-            {'params': [self.opacities], 'lr': 0.05}
+            {'params': [self.scales, self.quats], 'lr': 0.002}, # Lowered from 0.005
+            {'params': [self.opacities], 'lr': 0.02}            # Lowered from 0.05
         ])
 
     def train_submap(self, batch_rgbs, batch_poses, iterations=15):

@@ -25,7 +25,7 @@ class StreamingWindowEngine:
         
         # NEW: Decimation factor for 3DGS seeding. 
         # 0.05 means we only keep 5% of the dense VGGT points.
-        self.seed_keep_ratio = 0.05 
+        self.seed_keep_ratio = 0.20 
         
         print("[Engine] Initializing 3D Gaussian Splatting Streaming Engine...")
         self.reset()
@@ -172,7 +172,7 @@ class StreamingWindowEngine:
                 self.gs_mapper.seed_new_points(np.concatenate(seed_pts), np.concatenate(seed_colors))
                 
                 print(f"  > [3DGS] Training Submap on {len(batch_poses)} Keyframes (15 Steps)...")
-                self.gs_mapper.train_submap(batch_rgbs, batch_poses, iterations=15)
+                self.gs_mapper.train_submap(batch_rgbs, batch_poses, iterations=150)
             profiler["Gaussian_Splat_Training"] = time.time() - t3
             
             avg_alloc, max_alloc, avg_res, max_res = self.vram_tracker.stop()
