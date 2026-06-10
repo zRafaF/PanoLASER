@@ -1,242 +1,155 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import open3d as o3d
-import time
-from concurrent.futures import ThreadPoolExecutor
 
-from .nvblox_tsdf import NvbloxPanoTSDF
-from .inference_utils import align_cam_pts_irls
-from .utils.geometry import register_camera_poses_kabsch
-from .metricfication import estimate_metric_scale_from_floor
-from .vram_profiler import VRAMProfiler
+from nvblox_torch.mapper import Mapper
+from nvblox_torch.sensor import Sensor
+from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
 
-class StreamingWindowEngine:
-    def __init__(self, vanilla_engine, window_size=16, overlap=2, device="cuda"):
-        self.engine = vanilla_engine
-        self.window_size = window_size
-        self.overlap = overlap
-        self.device = device
+class NvbloxPanoTSDF:
+    def __init__(self, voxel_size_m=0.02, max_depth=4.5, face_size=1024, crop_margin=24, device="cuda"):
+        self.device = torch.device(device)
+        self.voxel_size_m = voxel_size_m
+        self.max_depth = max_depth 
+        self.face_size = face_size
+        self.crop_margin = crop_margin
         
-        self.target_camera_height = 1.7 
-        self.vram_tracker = VRAMProfiler()
+        print(f"[TSDF] Initializing C++ Nvblox Mapper ({voxel_size_m}m Voxels, Strict Truncation, {max_depth}m Cap)...")
         
-        # User Mutable Tuning Parameters
-        self.max_depth = 4.5
-        self.voxel_size = 0.02
-        self.min_translation_m = 0.10
+        proj_params = ProjectiveIntegratorParams()
+        proj_params.projective_integrator_max_integration_distance_m = self.max_depth
         
-        self.tsdf_executor = ThreadPoolExecutor(max_workers=1)
-        self.tsdf_future = None
-        self.tsdf = None
+        mapper_params = MapperParams()
+        mapper_params.set_projective_integrator_params(proj_params)
         
-        print("[Engine] Initializing Dynamic C++ Nvblox Keyframe Engine...")
-        self.reset()
+        self.mapper = Mapper(
+            voxel_sizes_m=self.voxel_size_m,
+            mapper_parameters=mapper_params
+        )
         
-    def reset(self):
-        if self.tsdf_future is not None:
-            self.tsdf_future.result()
-            self.tsdf_future = None
+        f = self.face_size / 2.0
+        w = self.face_size - (2 * self.crop_margin)
+        h = self.face_size - (2 * self.crop_margin)
+        c = w / 2.0 
+        
+        self.camera = Sensor.from_camera(
+            fu=f, fv=f, cu=c, cv=c, 
+            width=w, height=h
+        )
+        
+        self._precompute_cubemap_grids()
 
-        self.last_mesh = None
-        self.last_pcd = None
+    def _precompute_cubemap_grids(self):
+        u = torch.linspace(-1, 1, self.face_size, device=self.device)
+        v = torch.linspace(-1, 1, self.face_size, device=self.device)
+        v_grid, u_grid = torch.meshgrid(v, u, indexing='ij')
+        base_rays = torch.stack([u_grid, v_grid, torch.ones_like(u_grid)], dim=-1)
+        
+        self.face_rotations = [
+            torch.tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]], device=self.device, dtype=torch.float32), 
+            torch.tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], device=self.device, dtype=torch.float32),
+            torch.tensor([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], device=self.device, dtype=torch.float32),
+            torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]], device=self.device, dtype=torch.float32),
+            torch.tensor([[-1, 0, 0], [0, 0, -1], [0, -1, 0]], device=self.device, dtype=torch.float32),
+            torch.tensor([[-1, 0, 0], [0, 0, 1], [0, 1, 0]], device=self.device, dtype=torch.float32),
+        ]
+        
+        grids = []
+        for R in self.face_rotations:
+            ray_global = base_rays @ R.T
+            X, Y, Z = ray_global[..., 0], ray_global[..., 1], ray_global[..., 2]
+            norm = torch.sqrt(X**2 + Y**2 + Z**2)
+            theta = torch.atan2(X, Z) 
+            phi = torch.asin(torch.clamp(Y / norm, -1.0, 1.0)) 
+            u_norm = theta / torch.pi
+            v_norm = phi / (torch.pi / 2.0)
+            grids.append(torch.stack([u_norm, v_norm], dim=-1))
             
-        self.tsdf = NvbloxPanoTSDF(voxel_size_m=self.voxel_size, max_depth=self.max_depth, crop_margin=24, device=self.device)
-        
-        self.prev_overlap_raw_pts = []
-        self.prev_overlap_global_poses = []
-        self.trajectory = []
-        
-        self.full_poses = []
-        self.processed_indices = []
-        
-        self.submap_count = 0
-        self.is_first_window = True
-        self.current_metric_scale = 1.0
-        
-        self.last_integrated_position = None
+        self.batched_grids = torch.stack(grids, dim=0)
+        z_mult = 1.0 / torch.sqrt(u_grid**2 + v_grid**2 + 1.0)
+        self.batched_z_mults = z_mult.unsqueeze(0).expand(6, -1, -1)
 
-    def _async_tsdf_task(self, depth_maps, rgb_frames, masks, poses):
-        for j in range(len(poses)):
-            self.tsdf.integrate(depth_maps[j], rgb_frames[j], masks[j], poses[j])
-        torch.cuda.synchronize()
-
-    def process_sequence(self, frames, masks):
-        self.reset()
-        num_frames = len(frames)
-        t_seq_start = time.time()
-        
-        for i in range(0, num_frames - self.window_size + 1, self.window_size - self.overlap):
-            self.vram_tracker.start()
-            t_win_start = time.time()
-            profiler = {}
-
-            window_frames = frames[i : i + self.window_size]
-            window_masks = masks[i : i + self.window_size]
+    @torch.no_grad()
+    def integrate(self, pano_depth_map, pano_rgb, mask, pose):
+        if isinstance(pano_depth_map, np.ndarray):
+            pano_depth_map = torch.from_numpy(pano_depth_map).float().to(self.device)
+        if isinstance(pose, np.ndarray):
+            pose = torch.from_numpy(pose).float().to(self.device)
             
-            print(f"\n==========================================")
-            print(f"[Engine] Processing Submap {self.submap_count}...")
-            
-            t0 = time.time()
-            if self.tsdf_future is not None:
-                self.tsdf_future.result()
-                self.tsdf_future = None
-            profiler["TSDF_Sync"] = time.time() - t0
-            
-            t1 = time.time()
-            with torch.inference_mode():
-                preds = self.engine(window_frames)
-            torch.cuda.synchronize()  
-            profiler["VGGT_Inference"] = time.time() - t1
-
-            pts_list = [p.cpu().numpy() if isinstance(p, torch.Tensor) else p for p in preds["points"]]
-            poses = [p.cpu().numpy() if isinstance(p, torch.Tensor) else p for p in preds["poses"]]
-            del preds 
-            
-            t2 = time.time()
-            mid_idx = self.window_size // 2
-            floor_scale, floor_conf = estimate_metric_scale_from_floor(
-                pts_list[mid_idx], target_camera_height=self.target_camera_height
-            )
-            
-            if self.is_first_window:
-                if floor_scale is not None:
-                    self.current_metric_scale = floor_scale
-                else:
-                    first_depth = np.linalg.norm(pts_list[0], axis=-1)
-                    valid_depths = first_depth[first_depth > 0.1]
-                    if len(valid_depths) > 0:
-                        self.current_metric_scale = 3.0 / np.median(valid_depths)
+        if mask is not None:
+            if isinstance(mask, np.ndarray):
+                mask = torch.from_numpy(mask.copy()).float().to(self.device)
             else:
-                raw_scale_diff = align_cam_pts_irls(
-                    torch.from_numpy(pts_list[0].copy()), 
-                    torch.from_numpy(self.prev_overlap_raw_pts[0].copy()), 
-                    torch.from_numpy(window_masks[0].copy())
-                )
-                clipped_scale = np.clip(raw_scale_diff, 0.95, 1.05)
-                relative_scale = self.current_metric_scale * (0.8 * 1.0 + 0.2 * clipped_scale)
-                
-                if floor_scale is not None and floor_conf > 0.4:
-                    self.current_metric_scale = 0.9 * relative_scale + 0.1 * floor_scale
-                else:
-                    self.current_metric_scale = relative_scale
-
-            metric_local_poses = []
-            for p in poses:
-                mp = p.copy()
-                mp[:3, 3] *= self.current_metric_scale 
-                metric_local_poses.append(mp)
-                
-            submap_origin_inv = np.linalg.inv(metric_local_poses[0])
-            canonical_poses = [submap_origin_inv @ mp for mp in metric_local_poses]
-
-            anchor_pose = np.eye(4)
-            if not self.is_first_window:
-                src_cam_np = np.stack(canonical_poses[:self.overlap])
-                tgt_cam_np = np.stack(self.prev_overlap_global_poses)
-                R_align, t_align = register_camera_poses_kabsch(src_cam_np, tgt_cam_np, scale=1.0)
-                anchor_pose[:3, :3] = R_align
-                anchor_pose[:3, 3] = t_align
-                
-            batch_depths, batch_rgbs, batch_masks, batch_poses = [], [], [], []
-            start_idx = 0 if self.is_first_window else self.overlap
+                mask = mask.float()
+        else:
+            mask = torch.ones_like(pano_depth_map)
             
-            for j in range(self.window_size):
-                global_pose = anchor_pose @ canonical_poses[j]
-                
-                if j >= start_idx:
-                    current_pos = global_pose[:3, 3]
-                    self.trajectory.append(current_pos)
-                    
-                    self.processed_indices.append(i + j)
-                    self.full_poses.append(global_pose)
-                    
-                    should_integrate = False
-                    if self.last_integrated_position is None:
-                        should_integrate = True
-                    else:
-                        dist = np.linalg.norm(current_pos - self.last_integrated_position)
-                        if dist >= self.min_translation_m:
-                            should_integrate = True
-                            
-                    if should_integrate:
-                        self.last_integrated_position = current_pos.copy()
-                        
-                        tsdf_pose = global_pose.copy()
-                        if tsdf_pose[1, 1] < 0:
-                            flip_R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-                            tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ flip_R
-
-                        scaled_pts = pts_list[j] * self.current_metric_scale
-                        batch_depths.append(np.linalg.norm(scaled_pts, axis=-1))
-                        batch_rgbs.append(window_frames[j])
-                        batch_masks.append(window_masks[j])
-                        batch_poses.append(tsdf_pose) 
-                    
-                if j >= self.window_size - self.overlap:
-                    if j == self.window_size - self.overlap:
-                        self.prev_overlap_global_poses = []
-                    self.prev_overlap_global_poses.append(global_pose)
-            
-            self.prev_overlap_raw_pts = pts_list[-self.overlap:]
-            self.is_first_window = False
-            profiler["Scale_&_Pose_Math"] = time.time() - t2
-
-            t3 = time.time()
-            if len(batch_poses) > 0:
-                print(f"  > [TSDF] Sending {len(batch_poses)} Keyframes to C++ Background Mapper...")
-                self.tsdf_future = self.tsdf_executor.submit(
-                    self._async_tsdf_task, batch_depths, batch_rgbs, batch_masks, batch_poses
-                )
-            profiler["Nvblox_Enqueue"] = time.time() - t3
-            
-            avg_alloc, max_alloc, avg_res, max_res = self.vram_tracker.stop()
-            total_time = time.time() - t_win_start
-            
-            print("  --- Performance Profile ---")
-            for k, v in profiler.items():
-                print(f"    - {k:<30}: {v:.4f} sec")
-            print(f"  >>> Total Cycle Time: {total_time:.4f} sec")
-            print("  --- GPU Memory (VRAM) ---")
-            print(f"    - Allocated : {avg_alloc:.2f} GB (Avg) | {max_alloc:.2f} GB (Peak)")
-            print(f"    - Reserved  : {avg_res:.2f} GB (Avg) | {max_res:.2f} GB (Peak)")
-
-            self.submap_count += 1
-            
-            if self.submap_count % 3 == 0:
-                self.last_mesh = self.tsdf.extract_mesh()
-                self.last_pcd = o3d.geometry.PointCloud()
-                self.last_pcd.points = self.last_mesh.vertices
-                if self.last_mesh.has_vertex_colors():
-                    self.last_pcd.colors = self.last_mesh.vertex_colors
-
-            yield_mesh = self.last_mesh
-            yield_pcd = self.last_pcd
-
-            if yield_mesh is None or len(yield_mesh.vertices) == 0:
-                yield_mesh = o3d.geometry.TriangleMesh()
-                yield_pcd = o3d.geometry.PointCloud()
-                
-                if len(self.trajectory) > 0:
-                    yield_pcd.points = o3d.utility.Vector3dVector(np.array(self.trajectory))
-                    yield_pcd.paint_uniform_color([1.0, 0.0, 0.0]) 
-                else:
-                    yield_pcd.points = o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0]]))
-                
-                yield_mesh.vertices = o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.0, 0.001, 0.0]]))
-                yield_mesh.triangles = o3d.utility.Vector3iVector(np.array([[0, 1, 2]]))
-
-            yield yield_mesh, yield_pcd, np.array(self.trajectory), []
-
-        if self.tsdf_future is not None:
-            self.tsdf_future.result()
-
-        print("[Engine] Final Sequence: Extracting Unified Global Mesh...")
-        final_mesh = self.tsdf.extract_mesh()
+        # =========================================================
+        # THE PROTECTIVE FORCEFIELD (RAY-SHIELDING HALO)
+        # =========================================================
+        depth_shifted_x = torch.roll(pano_depth_map, shifts=-1, dims=1)
+        depth_shifted_y = torch.roll(pano_depth_map, shifts=-1, dims=0)
+        diff_x = torch.abs(pano_depth_map - depth_shifted_x)
+        diff_y = torch.abs(pano_depth_map - depth_shifted_y)
         
-        final_pcd = o3d.geometry.PointCloud()
-        final_pcd.points = final_mesh.vertices
-        if final_mesh.has_vertex_colors():
-            final_pcd.colors = final_mesh.vertex_colors
+        edge_mask = (diff_x < 0.08) & (diff_y < 0.08)
+        mask = mask * edge_mask.float()
+        
+        # Silhouette edges: identify sharp 20cm leaps in depth
+        silhouette_edges = ((diff_x > 0.20) | (diff_y > 0.20)).float()
+        edges_tensor = silhouette_edges.unsqueeze(0).unsqueeze(0)
+        
+        # Kernel 7 applies a massive 3-pixel deadzone around all thin walls
+        # ensuring that slightly misaligned cameras can NEVER shoot through them
+        dilated_edges = F.max_pool2d(edges_tensor, kernel_size=7, stride=1, padding=3).squeeze()
+        
+        mask = mask * (dilated_edges == 0.0).float()
+        # =========================================================
 
-        print(f"\n[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
-        yield final_mesh, final_pcd, np.array(self.trajectory), []
+        # FORCE COLOR OFF FOR NVBLOX: We handle this in PyTorch now.
+        use_color = False 
+        pano_rgb_tensor = None
+            
+        pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0)
+        pano_mask_tensor = mask.unsqueeze(0).unsqueeze(0)
+
+        for i in range(6):
+            radial_depth = F.grid_sample(
+                pano_depth_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=True
+            ).squeeze(0).squeeze(0)
+            
+            face_mask = F.grid_sample(
+                pano_mask_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=True
+            ).squeeze(0).squeeze(0)
+            
+            if i == 5:
+                u_coords = self.batched_grids[i, :, :, 0]
+                v_coords = self.batched_grids[i, :, :, 1]
+                radius_sq = u_coords**2 + v_coords**2
+                nadir_mask = (radius_sq > 0.35**2).float() 
+                face_mask = face_mask * nadir_mask
+
+            optical_depth = radial_depth * self.batched_z_mults[i]
+            optical_depth[face_mask < 0.5] = -1.0
+            
+            # Distance Cap - Essential to stop far geometry from erasing near walls
+            optical_depth[optical_depth > self.max_depth] = -1.0
+            
+            # color_face_uint8 logic completely bypassed
+            color_face_uint8 = None
+
+            if self.crop_margin > 0:
+                c = self.crop_margin
+                optical_depth = optical_depth[c:-c, c:-c].contiguous()
+
+            face_pose = pose.clone()
+            face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
+            face_pose_cpu = face_pose.cpu()
+            
+            self.mapper.add_depth_frame(optical_depth, face_pose_cpu, self.camera)
+
+    def extract_mesh(self):
+        # We extract the geometry mesh, the colors will be overwritten in python
+        self.mapper.update_color_mesh()
+        return self.mapper.get_color_mesh().to_open3d()

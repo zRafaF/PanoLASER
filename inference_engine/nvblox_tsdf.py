@@ -107,13 +107,9 @@ class NvbloxPanoTSDF:
         mask = mask * (dilated_edges == 0.0).float()
         # =========================================================
 
-        use_color = pano_rgb is not None
-        if use_color:
-            if isinstance(pano_rgb, np.ndarray):
-                pano_rgb = torch.from_numpy(pano_rgb).float().to(self.device)
-            pano_rgb_tensor = pano_rgb.permute(2, 0, 1).unsqueeze(0)
-        else:
-            pano_rgb_tensor = None
+        # FORCE COLOR OFF FOR NVBLOX: We handle this in PyTorch now.
+        use_color = False 
+        pano_rgb_tensor = None
             
         pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0)
         pano_mask_tensor = mask.unsqueeze(0).unsqueeze(0)
@@ -140,29 +136,20 @@ class NvbloxPanoTSDF:
             # Distance Cap - Essential to stop far geometry from erasing near walls
             optical_depth[optical_depth > self.max_depth] = -1.0
             
+            # color_face_uint8 logic completely bypassed
             color_face_uint8 = None
-            if use_color and i != 5:
-                color_face = F.grid_sample(
-                    pano_rgb_tensor, self.batched_grids[i:i+1], mode='bilinear', align_corners=True
-                ).squeeze(0)
-                if color_face.is_floating_point() and color_face.max() <= 1.0:
-                    color_face = color_face * 255.0
-                color_face_uint8 = color_face.permute(1, 2, 0).to(torch.uint8).contiguous()
 
             if self.crop_margin > 0:
                 c = self.crop_margin
                 optical_depth = optical_depth[c:-c, c:-c].contiguous()
-                if color_face_uint8 is not None:
-                    color_face_uint8 = color_face_uint8[c:-c, c:-c, :].contiguous()
 
             face_pose = pose.clone()
             face_pose[:3, :3] = pose[:3, :3] @ self.face_rotations[i]
             face_pose_cpu = face_pose.cpu()
             
             self.mapper.add_depth_frame(optical_depth, face_pose_cpu, self.camera)
-            if color_face_uint8 is not None:
-                self.mapper.add_color_frame(color_face_uint8, face_pose_cpu, self.camera)
 
     def extract_mesh(self):
+        # We extract the geometry mesh, the colors will be overwritten in python
         self.mapper.update_color_mesh()
         return self.mapper.get_color_mesh().to_open3d()
