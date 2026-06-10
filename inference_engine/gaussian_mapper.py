@@ -97,7 +97,6 @@ class PanoGaussianMapper(nn.Module):
         if self.means.shape[0] == 0: return
         
         self.train()
-        num_frames = len(batch_rgbs)
         
         # Prepare GT Cubemaps on GPU
         gt_cubemaps = []
@@ -116,8 +115,11 @@ class PanoGaussianMapper(nn.Module):
                     faces.append(face.squeeze(0).permute(1, 2, 0)) # (H, W, 3)
                     
                     # 3. Calculate View Matrix (Extrinsics) for each face
-                    R_c_w = pose[:3, :3].T
-                    t_c_w = -R_c_w @ pose[:3, 3]
+                    # FIX: Explicitly cast the NumPy pose array to a PyTorch GPU Tensor
+                    pose_t = torch.from_numpy(pose).float().to(self.device)
+                    
+                    R_c_w = pose_t[:3, :3].T
+                    t_c_w = -R_c_w @ pose_t[:3, 3]
                     
                     face_viewmat = torch.eye(4, device=self.device)
                     face_viewmat[:3, :3] = self.face_rotations[i].T @ R_c_w
@@ -172,6 +174,4 @@ class PanoGaussianMapper(nn.Module):
     @torch.no_grad()
     def save_ply(self, path):
         """Exports standard 3DGS .ply for WebGL viewers (SuperSplat, PlayCanvas)"""
-        # (Implementation omitted for brevity, but it serializes the tensors into the strict 
-        # structure expected by Gaussian Splatting viewers: f_dc_0, rot_0, scale_0, etc.)
         pass
