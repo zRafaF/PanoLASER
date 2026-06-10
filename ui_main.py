@@ -149,7 +149,8 @@ def check_files_ui(input_mode, uploaded_files, local_dir, decimation):
 def process_sequence_ui(
     input_mode, uploaded_files, local_dir, decimation,
     zenith_limit, nadir_limit, target_width, target_height, 
-    window_size, overlap, max_depth, voxel_size, keyframe_dist
+    window_size, overlap, max_depth, voxel_size, keyframe_dist,
+    live_stream_toggle
 ):
     file_paths = get_file_list(input_mode, uploaded_files, local_dir, decimation)
     if not file_paths or len(file_paths) < 2:
@@ -163,22 +164,40 @@ def process_sequence_ui(
 
     backend_state["frames"] = frames
     
-    # Inject all the fine-tuning parameters!
     streaming_engine.window_size = int(window_size)
     streaming_engine.overlap = int(overlap)
     streaming_engine.max_depth = float(max_depth)
     streaming_engine.voxel_size = float(voxel_size)
     streaming_engine.min_translation_m = float(keyframe_dist)
 
-    for mesh, global_pcd, trajectory, lc_edges in streaming_engine.process_sequence(frames, masks):
-        fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, lc_edges)
-        pcd_path = save_pcd_to_ply(global_pcd, "live_map")
+    last_mesh, last_pcd, last_traj, last_edges = None, None, None, None
+    generator = streaming_engine.process_sequence(frames, masks)
+    
+    for mesh, global_pcd, trajectory, lc_edges in generator:
+        last_mesh, last_pcd, last_traj, last_edges = mesh, global_pcd, trajectory, lc_edges
         
-        if mesh is None or len(mesh.vertices) == 0:
-            yield fig, pcd_path, None, None, gr.update(interactive=False)
+        # Only do the heavy serialization if live streaming is ON
+        if live_stream_toggle:
+            fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, lc_edges)
+            pcd_path = save_pcd_to_ply(global_pcd, "live_map")
+            
+            if mesh is None or len(mesh.vertices) == 0:
+                yield fig, pcd_path, None, None, gr.update(interactive=False)
+            else:
+                backend_state["mesh"] = mesh
+                mesh_path = save_mesh_to_glb(mesh, "final_scene")
+                yield fig, pcd_path, mesh_path, mesh_path, gr.update(interactive=False)
+
+    # Force the final render at the end of the generator (Guarantees the end result)
+    if last_pcd is not None:
+        fig = create_plotly_figure_with_trajectory(last_pcd, last_traj, last_edges)
+        pcd_path = save_pcd_to_ply(last_pcd, "live_map")
+        
+        if last_mesh is None or len(last_mesh.vertices) == 0:
+            yield fig, pcd_path, None, None, gr.update(interactive=True)
         else:
-            backend_state["mesh"] = mesh
-            mesh_path = save_mesh_to_glb(mesh, "final_scene")
+            backend_state["mesh"] = last_mesh
+            mesh_path = save_mesh_to_glb(last_mesh, "final_scene")
             yield fig, pcd_path, mesh_path, mesh_path, gr.update(interactive=True)
 
 def run_texture_optimization():
@@ -209,6 +228,9 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
 
     with gr.Row():
         with gr.Column(scale=1):
+            gr.Markdown("### 🚀 Real-Time Execution")
+            live_stream_checkbox = gr.Checkbox(value=False, label="Live UI Streaming (Slows down processing)")
+
             gr.Markdown("### Processing Controls")
             with gr.Row():
                 step_size = gr.Number(value=14, label="Step Size")
@@ -284,7 +306,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="PanoLASER Streaming Engine")
         inputs=[
             input_mode, input_seq, local_dir_input, decimation_input, zenith_slider, nadir_slider, 
             target_width, target_height, window_size_slider, overlap_slider, 
-            max_depth_slider, voxel_size_slider, keyframe_dist_slider # <--- ALL SLIDERS LINKED
+            max_depth_slider, voxel_size_slider, keyframe_dist_slider, live_stream_checkbox
         ],
         outputs=[output_3d_seq, download_seq, output_mesh, download_mesh, optimize_tex_btn]
     )

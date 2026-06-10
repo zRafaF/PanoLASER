@@ -67,69 +67,86 @@ class StreamingWindowEngine:
     @torch.no_grad()
     def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_depths, batch_masks, batch_poses):
         """
-        Projects mesh vertices back into panoramic keyframes.
-        Features: Distance Attenuation, Z-Buffer Occlusion, Lens Confidence, and Anti-Smear.
+        Batched and Chunked implementation. 
+        Projects vertices into all keyframes simultaneously to avoid Python loop overhead.
         """
         num_pts = vertices_np.shape[0]
         if num_pts == 0 or len(batch_rgbs) == 0:
             return np.zeros((num_pts, 3))
 
-        vertices = torch.from_numpy(vertices_np).float().to(self.device)
-        normals = torch.from_numpy(normals_np).float().to(self.device)
+        B = len(batch_rgbs)
+        device = self.device
 
-        best_scores = torch.full((num_pts,), -1.0, device=self.device)
-        final_colors = torch.zeros((num_pts, 3), device=self.device)
+        # Pre-load entire batch to GPU 
+        imgs_t = torch.from_numpy(np.stack(batch_rgbs)).float().to(device) / 255.0
+        imgs_t = imgs_t.permute(0, 3, 1, 2) # (B, 3, H, W)
+        
+        depths_t = torch.from_numpy(np.stack(batch_depths)).float().to(device).unsqueeze(1) # (B, 1, H, W)
+        masks_t = torch.from_numpy(np.stack(batch_masks)).float().to(device).unsqueeze(1) # (B, 1, H, W)
+        
+        poses_t = torch.from_numpy(np.stack(batch_poses)).float().to(device)
+        R_w_c = poses_t[:, :3, :3] # (B, 3, 3)
+        t_w_c = poses_t[:, :3, 3]  # (B, 3)
 
-        for rgb_np, depth_np, mask_np, pose_np in zip(batch_rgbs, batch_depths, batch_masks, batch_poses):
-            img_t = torch.from_numpy(rgb_np).float().to(self.device) / 255.0
-            img_t = img_t.permute(2, 0, 1).unsqueeze(0)
+        vertices = torch.from_numpy(vertices_np).float().to(device)
+        normals = torch.from_numpy(normals_np).float().to(device)
+
+        final_colors = torch.zeros((num_pts, 3), device=device)
+        
+        # Process in chunks to prevent VRAM explosion when batching B cameras
+        CHUNK_SIZE = 500_000 
+        
+        for start_idx in range(0, num_pts, CHUNK_SIZE):
+            end_idx = min(start_idx + CHUNK_SIZE, num_pts)
+            v_chunk = vertices[start_idx:end_idx] # (C, 3)
+            n_chunk = normals[start_idx:end_idx]  # (C, 3)
+            C_size = v_chunk.shape[0]
+
+            # Vectorized projection: (P - T) @ R
+            diff = v_chunk.unsqueeze(0) - t_w_c.unsqueeze(1) # (B, C, 3)
+            V_c = torch.bmm(diff, R_w_c) # (B, C, 3)
             
-            depth_t = torch.from_numpy(depth_np).float().to(self.device).unsqueeze(0).unsqueeze(0)
-            mask_t = torch.from_numpy(mask_np).float().to(self.device).unsqueeze(0).unsqueeze(0)
-
-            pose_t = torch.from_numpy(pose_np).float().to(self.device)
-            R_w_c = pose_t[:3, :3]
-            t_w_c = pose_t[:3, 3]
-
-            V_c = (vertices - t_w_c) @ R_w_c 
-            X, Y, Z = V_c[:, 0], V_c[:, 1], V_c[:, 2]
-            dist = torch.sqrt(X**2 + Y**2 + Z**2)
+            X, Y, Z = V_c[..., 0], V_c[..., 1], V_c[..., 2]
+            dist = torch.sqrt(X**2 + Y**2 + Z**2) # (B, C)
 
             theta = torch.atan2(X, Z)
             phi = torch.asin(torch.clamp(Y / (dist + 1e-6), -1.0, 1.0))
             u_norm = theta / torch.pi
             v_norm = phi / (torch.pi / 2.0)
             
-            grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0) 
+            grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(2) # (B, C, 1, 2)
 
-            sampled_colors = torch.nn.functional.grid_sample(img_t, grid, mode='bilinear', align_corners=False).squeeze().T
-            sampled_depths = torch.nn.functional.grid_sample(depth_t, grid, mode='nearest', align_corners=False).squeeze()
-            sampled_masks = torch.nn.functional.grid_sample(mask_t, grid, mode='nearest', align_corners=False).squeeze()
+            sampled_colors = torch.nn.functional.grid_sample(imgs_t, grid, mode='bilinear', align_corners=False).squeeze(3) # (B, 3, C)
+            sampled_depths = torch.nn.functional.grid_sample(depths_t, grid, mode='nearest', align_corners=False).squeeze(3).squeeze(1) # (B, C)
+            sampled_masks = torch.nn.functional.grid_sample(masks_t, grid, mode='nearest', align_corners=False).squeeze(3).squeeze(1) # (B, C)
 
             valid_mask_hit = sampled_masks > 0.5
-            is_not_black = sampled_colors.sum(dim=1) > 0.15
+            is_not_black = sampled_colors.sum(dim=1) > 0.15 # (B, C)
+            is_visible = dist <= (sampled_depths + 0.15)
             
-            # Z-Buffer Occlusion: Prevent painting objects hiding behind walls
-            depth_tolerance = 0.15 
-            is_visible = dist <= (sampled_depths + depth_tolerance)
-
-            view_dirs_w = (t_w_c - vertices) / (dist.unsqueeze(1) + 1e-6)
-            dot_prod = (view_dirs_w * normals).sum(dim=1)
+            view_dirs_w = -diff / (dist.unsqueeze(-1) + 1e-6) # (B, C, 3)
+            dot_prod = (view_dirs_w * n_chunk.unsqueeze(0)).sum(dim=-1) # (B, C)
             
-            # Lens Confidence penalizes distorted top/bottom poles of equirectangular images
-            lens_confidence = torch.cos(phi)
+            lens_confidence = torch.cos(phi) # (B, C)
             
             valid_condition = (dist > 0.1) & valid_mask_hit & is_visible & (dot_prod > 0) & is_not_black
 
             score = torch.where(
                 valid_condition,
                 (dot_prod * lens_confidence) / (dist**2 + 1e-6),
-                torch.tensor(-1.0, device=self.device)
-            )
+                torch.tensor(-1.0, device=device)
+            ) # (B, C)
 
-            update_mask = score > best_scores
-            best_scores[update_mask] = score[update_mask]
-            final_colors[update_mask] = sampled_colors[update_mask]
+            # Pick the best camera for each point
+            max_scores, best_cam_idx = torch.max(score, dim=0) # (C,), (C,)
+            
+            update_mask = max_scores > -1.0
+            if update_mask.any():
+                valid_cams = best_cam_idx[update_mask]
+                valid_pts = torch.arange(C_size, device=device)[update_mask]
+                
+                best_colors = sampled_colors[valid_cams, :, valid_pts] # (N_valid, 3)
+                final_colors[start_idx:end_idx][update_mask] = best_colors
 
         return final_colors.cpu().numpy()
 
