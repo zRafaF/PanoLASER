@@ -248,7 +248,7 @@ class StreamingWindowEngine:
                             tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ flip_R
 
                         scaled_pts = pts_list[j] * self.current_metric_scale
-                        depth_map = np.linalg.norm(scaled_pts, axis=-1) # Calculate this once
+                        depth_map = np.linalg.norm(scaled_pts, axis=-1)
                         
                         # Local batches for C++ Nvblox
                         batch_depths.append(depth_map)
@@ -256,7 +256,7 @@ class StreamingWindowEngine:
                         batch_masks.append(window_masks[j])
                         batch_poses.append(tsdf_pose) 
                         
-                        # NEW: Global tracking for PyTorch Shader
+                        # Global tracking for PyTorch Shader
                         self.kf_depths.append(depth_map)
                         self.kf_rgbs.append(window_frames[j])
                         self.kf_masks.append(window_masks[j])
@@ -299,10 +299,7 @@ class StreamingWindowEngine:
                 if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
                     t_color_start = time.time()
                     
-                    # Ensure normals exist for angle math
                     self.last_mesh.compute_vertex_normals()
-                    
-                    used_frames = [frames[idx] for idx in self.processed_indices]
                     
                     colored_vertices = self._apply_pytorch_colors(
                         np.asarray(self.last_mesh.vertices),
@@ -345,15 +342,16 @@ class StreamingWindowEngine:
         print("[Engine] Final Sequence: Extracting Unified Global Mesh...")
         final_mesh = self.tsdf.extract_mesh()
         
-        # Apply Final Global Coloring
+        # Apply Final Global Coloring (FIXED)
         if final_mesh is not None and len(final_mesh.vertices) > 0:
             final_mesh.compute_vertex_normals()
-            used_frames = [frames[idx] for idx in self.processed_indices]
             final_colors = self._apply_pytorch_colors(
                 np.asarray(final_mesh.vertices),
                 np.asarray(final_mesh.vertex_normals),
-                used_frames,
-                self.full_poses
+                self.kf_rgbs,
+                self.kf_depths,
+                self.kf_masks,
+                self.kf_poses
             )
             final_mesh.vertex_colors = o3d.utility.Vector3dVector(final_colors)
         
