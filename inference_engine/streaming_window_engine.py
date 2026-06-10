@@ -48,6 +48,11 @@ class StreamingWindowEngine:
         
         self.full_poses = []
         self.processed_indices = []
+
+        self.kf_rgbs = []
+        self.kf_depths = []
+        self.kf_masks = []
+        self.kf_poses = []
         
         self.submap_count = 0
         self.is_first_window = True
@@ -61,10 +66,10 @@ class StreamingWindowEngine:
         torch.cuda.synchronize()
 
     @torch.no_grad()
-    def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_poses):
+    def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_depths, batch_masks, batch_poses):
         """
-        Projects mesh vertices back into panoramic keyframes to assign the best color.
-        Uses Argmax(Distance, Angle) to prevent ghosting.
+        Projects mesh vertices back into panoramic keyframes.
+        Features: Distance Attenuation, Angle Alignment, Z-Buffer Occlusion, and Deadzone Masking.
         """
         num_pts = vertices_np.shape[0]
         if num_pts == 0 or len(batch_rgbs) == 0:
@@ -76,55 +81,60 @@ class StreamingWindowEngine:
         best_scores = torch.full((num_pts,), -1.0, device=self.device)
         final_colors = torch.zeros((num_pts, 3), device=self.device)
 
-        for rgb_np, pose_np in zip(batch_rgbs, batch_poses):
-            # Prepare image tensor for grid_sample (1, 3, H, W)
+        for rgb_np, depth_np, mask_np, pose_np in zip(batch_rgbs, batch_depths, batch_masks, batch_poses):
+            # 1. Prepare Tensors (1, Channels, H, W)
             img_t = torch.from_numpy(rgb_np).float().to(self.device) / 255.0
             img_t = img_t.permute(2, 0, 1).unsqueeze(0)
+            
+            depth_t = torch.from_numpy(depth_np).float().to(self.device).unsqueeze(0).unsqueeze(0)
+            mask_t = torch.from_numpy(mask_np).float().to(self.device).unsqueeze(0).unsqueeze(0)
 
-            # Camera pose math
+            # 2. Camera pose math
             pose_t = torch.from_numpy(pose_np).float().to(self.device)
             R_w_c = pose_t[:3, :3]
             t_w_c = pose_t[:3, 3]
 
-            # Transform vertices to Camera Space: V_c = R_w_c^T @ (V_w - t_w_c)
             V_c = (vertices - t_w_c) @ R_w_c 
-
             X, Y, Z = V_c[:, 0], V_c[:, 1], V_c[:, 2]
             dist = torch.sqrt(X**2 + Y**2 + Z**2)
 
-            # Protect against division by zero at camera origin
-            valid_mask = dist > 0.1
-
-            # Convert to Equirectangular UVs [-1, 1]
+            # 3. Convert to Equirectangular UVs [-1, 1]
             theta = torch.atan2(X, Z)
             phi = torch.asin(torch.clamp(Y / (dist + 1e-6), -1.0, 1.0))
-            
             u_norm = theta / torch.pi
             v_norm = phi / (torch.pi / 2.0)
             
-            # Format for grid_sample: (N, 1, 1, 2) to match expected 4D input
             grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0) 
 
-            sampled_colors = torch.nn.functional.grid_sample(
-                img_t, grid, mode='bilinear', align_corners=True
-            ).squeeze().T # Transpose back to (N, 3)
+            # 4. Simultaneous Grid Sampling
+            sampled_colors = torch.nn.functional.grid_sample(img_t, grid, mode='bilinear', align_corners=True).squeeze().T
+            sampled_depths = torch.nn.functional.grid_sample(depth_t, grid, mode='nearest', align_corners=True).squeeze()
+            sampled_masks = torch.nn.functional.grid_sample(mask_t, grid, mode='nearest', align_corners=True).squeeze()
 
-            # Calculate Heuristic Score
-            # View direction from point to camera: (Camera Pos - Point Pos) / dist
-            view_dirs_w = (t_w_c - vertices) / (dist.unsqueeze(1) + 1e-6)
+            # --- THE FIXES ---
             
-            # Head-on view: Dot product of surface normal and view direction approaching 1
+            # A. Mask Check: Did we hit the black pole/sky?
+            valid_mask_hit = sampled_masks > 0.5
+            
+            # B. Z-Buffer Occlusion: Is the vertex hiding behind a surface?
+            # We add a 15cm tolerance (0.15) to account for mesh smoothing/quantization
+            depth_tolerance = 0.15 
+            is_visible = dist <= (sampled_depths + depth_tolerance)
+
+            # C. Score Calculation
+            view_dirs_w = (t_w_c - vertices) / (dist.unsqueeze(1) + 1e-6)
             dot_prod = (view_dirs_w * normals).sum(dim=1)
             
-            # Score = Angle Alignment / Distance Squared. 
-            # We only evaluate front-facing points (dot_prod > 0)
+            # Must be front-facing AND unoccluded AND inside the valid mask
+            valid_condition = (dist > 0.1) & valid_mask_hit & is_visible & (dot_prod > 0)
+
             score = torch.where(
-                (valid_mask) & (dot_prod > 0),
+                valid_condition,
                 dot_prod / (dist**2 + 1e-6),
                 torch.tensor(-1.0, device=self.device)
             )
 
-            # Winner takes all update
+            # Winner takes all
             update_mask = score > best_scores
             best_scores[update_mask] = score[update_mask]
             final_colors[update_mask] = sampled_colors[update_mask]
@@ -238,10 +248,19 @@ class StreamingWindowEngine:
                             tsdf_pose[:3, :3] = tsdf_pose[:3, :3] @ flip_R
 
                         scaled_pts = pts_list[j] * self.current_metric_scale
-                        batch_depths.append(np.linalg.norm(scaled_pts, axis=-1))
+                        depth_map = np.linalg.norm(scaled_pts, axis=-1) # Calculate this once
+                        
+                        # Local batches for C++ Nvblox
+                        batch_depths.append(depth_map)
                         batch_rgbs.append(window_frames[j])
                         batch_masks.append(window_masks[j])
                         batch_poses.append(tsdf_pose) 
+                        
+                        # NEW: Global tracking for PyTorch Shader
+                        self.kf_depths.append(depth_map)
+                        self.kf_rgbs.append(window_frames[j])
+                        self.kf_masks.append(window_masks[j])
+                        self.kf_poses.append(tsdf_pose) 
                     
                 if j >= self.window_size - self.overlap:
                     if j == self.window_size - self.overlap:
@@ -288,8 +307,10 @@ class StreamingWindowEngine:
                     colored_vertices = self._apply_pytorch_colors(
                         np.asarray(self.last_mesh.vertices),
                         np.asarray(self.last_mesh.vertex_normals),
-                        used_frames,
-                        self.full_poses
+                        self.kf_rgbs,
+                        self.kf_depths,
+                        self.kf_masks,
+                        self.kf_poses
                     )
                     
                     self.last_mesh.vertex_colors = o3d.utility.Vector3dVector(colored_vertices)
