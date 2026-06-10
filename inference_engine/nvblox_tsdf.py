@@ -96,18 +96,13 @@ class NvbloxPanoTSDF:
         edge_mask = (diff_x < 0.08) & (diff_y < 0.08)
         mask = mask * edge_mask.float()
         
-        # Silhouette edges: identify sharp 20cm leaps in depth
         silhouette_edges = ((diff_x > 0.20) | (diff_y > 0.20)).float()
         edges_tensor = silhouette_edges.unsqueeze(0).unsqueeze(0)
         
-        # Kernel 7 applies a massive 3-pixel deadzone around all thin walls
-        # ensuring that slightly misaligned cameras can NEVER shoot through them
         dilated_edges = F.max_pool2d(edges_tensor, kernel_size=7, stride=1, padding=3).squeeze()
-        
         mask = mask * (dilated_edges == 0.0).float()
         # =========================================================
 
-        # FORCE COLOR OFF FOR NVBLOX: We handle this in PyTorch now.
         use_color = False 
         pano_rgb_tensor = None
             
@@ -115,28 +110,26 @@ class NvbloxPanoTSDF:
         pano_mask_tensor = mask.unsqueeze(0).unsqueeze(0)
 
         for i in range(6):
+            # align_corners=False prevents 1-pixel spherical wrapping bugs
             radial_depth = F.grid_sample(
-                pano_depth_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=True
+                pano_depth_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=False
             ).squeeze(0).squeeze(0)
+            
+            # CRITICAL: Sanitize NaNs and Infs to prevent stdgpu CUDA 700 crashes
+            radial_depth = torch.nan_to_num(radial_depth, nan=-1.0, posinf=-1.0, neginf=-1.0)
             
             face_mask = F.grid_sample(
-                pano_mask_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=True
+                pano_mask_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=False
             ).squeeze(0).squeeze(0)
-            
-            if i == 5:
-                u_coords = self.batched_grids[i, :, :, 0]
-                v_coords = self.batched_grids[i, :, :, 1]
-                radius_sq = u_coords**2 + v_coords**2
-                nadir_mask = (radius_sq > 0.35**2).float() 
-                face_mask = face_mask * nadir_mask
+
+            # Hardcoded 0.35 nadir_mask removed here to prevent "double-masking" outline
 
             optical_depth = radial_depth * self.batched_z_mults[i]
             optical_depth[face_mask < 0.5] = -1.0
             
-            # Distance Cap - Essential to stop far geometry from erasing near walls
             optical_depth[optical_depth > self.max_depth] = -1.0
+            optical_depth[optical_depth < 0.1] = -1.0 # Ensure no negative/zero anomalies slip through
             
-            # color_face_uint8 logic completely bypassed
             color_face_uint8 = None
 
             if self.crop_margin > 0:
@@ -150,6 +143,5 @@ class NvbloxPanoTSDF:
             self.mapper.add_depth_frame(optical_depth, face_pose_cpu, self.camera)
 
     def extract_mesh(self):
-        # We extract the geometry mesh, the colors will be overwritten in python
         self.mapper.update_color_mesh()
         return self.mapper.get_color_mesh().to_open3d()

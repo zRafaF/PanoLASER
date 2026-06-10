@@ -20,7 +20,6 @@ class StreamingWindowEngine:
         self.target_camera_height = 1.7 
         self.vram_tracker = VRAMProfiler()
         
-        # User Mutable Tuning Parameters
         self.max_depth = 4.5
         self.voxel_size = 0.02
         self.min_translation_m = 0.10
@@ -82,14 +81,12 @@ class StreamingWindowEngine:
         final_colors = torch.zeros((num_pts, 3), device=self.device)
 
         for rgb_np, depth_np, mask_np, pose_np in zip(batch_rgbs, batch_depths, batch_masks, batch_poses):
-            # 1. Prepare Tensors (1, Channels, H, W)
             img_t = torch.from_numpy(rgb_np).float().to(self.device) / 255.0
             img_t = img_t.permute(2, 0, 1).unsqueeze(0)
             
             depth_t = torch.from_numpy(depth_np).float().to(self.device).unsqueeze(0).unsqueeze(0)
             mask_t = torch.from_numpy(mask_np).float().to(self.device).unsqueeze(0).unsqueeze(0)
 
-            # 2. Camera pose math
             pose_t = torch.from_numpy(pose_np).float().to(self.device)
             R_w_c = pose_t[:3, :3]
             t_w_c = pose_t[:3, 3]
@@ -98,7 +95,6 @@ class StreamingWindowEngine:
             X, Y, Z = V_c[:, 0], V_c[:, 1], V_c[:, 2]
             dist = torch.sqrt(X**2 + Y**2 + Z**2)
 
-            # 3. Convert to Equirectangular UVs [-1, 1]
             theta = torch.atan2(X, Z)
             phi = torch.asin(torch.clamp(Y / (dist + 1e-6), -1.0, 1.0))
             u_norm = theta / torch.pi
@@ -106,46 +102,32 @@ class StreamingWindowEngine:
             
             grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0) 
 
-            # 4. Simultaneous Grid Sampling
-            sampled_colors = torch.nn.functional.grid_sample(img_t, grid, mode='bilinear', align_corners=True).squeeze().T
-            sampled_depths = torch.nn.functional.grid_sample(depth_t, grid, mode='nearest', align_corners=True).squeeze()
-            sampled_masks = torch.nn.functional.grid_sample(mask_t, grid, mode='nearest', align_corners=True).squeeze()
+            # align_corners=False prevents bleeding from the opposite side of the 360 wrap
+            sampled_colors = torch.nn.functional.grid_sample(img_t, grid, mode='bilinear', align_corners=False).squeeze().T
+            sampled_depths = torch.nn.functional.grid_sample(depth_t, grid, mode='nearest', align_corners=False).squeeze()
+            sampled_masks = torch.nn.functional.grid_sample(mask_t, grid, mode='nearest', align_corners=False).squeeze()
 
-            # --- THE FIXES ---
-            
-            # A. Mask Check: Did we hit the valid mask?
             valid_mask_hit = sampled_masks > 0.5
             
-            # B. Anti-Smear Check: Is the sampled pixel practically black?
-            # Even if the mask bleeds, if the pixel is black (the tripod/pole), ignore it entirely.
-            is_not_black = sampled_colors.sum(dim=1) > 0.05
+            # Tightened to > 0.15 to ensure bilinear bleeding of the black tripod edge is discarded entirely
+            is_not_black = sampled_colors.sum(dim=1) > 0.15
             
-            # C. Z-Buffer Occlusion: Is the vertex hiding behind a surface?
             depth_tolerance = 0.15 
             is_visible = dist <= (sampled_depths + depth_tolerance)
 
-            # D. View Alignment
             view_dirs_w = (t_w_c - vertices) / (dist.unsqueeze(1) + 1e-6)
             dot_prod = (view_dirs_w * normals).sum(dim=1)
             
-            # E. Lens Confidence (Equirectangular Penalty)
-            # The poles of a 360 image are heavily distorted. 
-            # cos(phi) equals 1.0 at the horizon and drops to 0.0 at the exact top/bottom.
-            # This mathematically forces the algorithm to prefer painting the floor using 
-            # a camera looking AT the floor from an angle, rather than one directly ABOVE it.
             lens_confidence = torch.cos(phi)
             
-            # F. Final Validation
             valid_condition = (dist > 0.1) & valid_mask_hit & is_visible & (dot_prod > 0) & is_not_black
 
-            # Modifying the heuristic to include Lens Confidence
             score = torch.where(
                 valid_condition,
                 (dot_prod * lens_confidence) / (dist**2 + 1e-6),
                 torch.tensor(-1.0, device=self.device)
             )
 
-            # Winner takes all
             update_mask = score > best_scores
             best_scores[update_mask] = score[update_mask]
             final_colors[update_mask] = sampled_colors[update_mask]
@@ -261,13 +243,14 @@ class StreamingWindowEngine:
                         scaled_pts = pts_list[j] * self.current_metric_scale
                         depth_map = np.linalg.norm(scaled_pts, axis=-1)
                         
-                        # Local batches for C++ Nvblox
+                        # CRITICAL: Sanitize Depth Map to prevent C++ Nvblox Hash Allocation crashes
+                        depth_map = np.nan_to_num(depth_map, nan=0.0, posinf=0.0, neginf=0.0)
+                        
                         batch_depths.append(depth_map)
                         batch_rgbs.append(window_frames[j])
                         batch_masks.append(window_masks[j])
                         batch_poses.append(tsdf_pose) 
                         
-                        # Global tracking for PyTorch Shader
                         self.kf_depths.append(depth_map)
                         self.kf_rgbs.append(window_frames[j])
                         self.kf_masks.append(window_masks[j])
@@ -306,7 +289,6 @@ class StreamingWindowEngine:
             if self.submap_count % 3 == 0:
                 self.last_mesh = self.tsdf.extract_mesh()
                 
-                # Apply PyTorch Coloring Shader
                 if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
                     t_color_start = time.time()
                     
@@ -324,10 +306,8 @@ class StreamingWindowEngine:
                     self.last_mesh.vertex_colors = o3d.utility.Vector3dVector(colored_vertices)
                     print(f"  > [Coloring] PyTorch Raycasting applied to {len(self.last_mesh.vertices)} vertices in {time.time() - t_color_start:.4f} sec")
 
-                # Point Cloud Generation & Unpainted Vertex Filtering
                 self.last_pcd = o3d.geometry.PointCloud()
                 if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
-                    # Drop vertices that remained black (unpainted) so they don't look like dust
                     valid_color_mask = colored_vertices.sum(axis=1) > 0.0
                     filtered_points = np.asarray(self.last_mesh.vertices)[valid_color_mask]
                     filtered_colors = colored_vertices[valid_color_mask]
@@ -359,7 +339,6 @@ class StreamingWindowEngine:
         print("[Engine] Final Sequence: Extracting Unified Global Mesh...")
         final_mesh = self.tsdf.extract_mesh()
         
-        # Apply Final Global Coloring
         if final_mesh is not None and len(final_mesh.vertices) > 0:
             final_mesh.compute_vertex_normals()
             final_colors = self._apply_pytorch_colors(
@@ -372,7 +351,6 @@ class StreamingWindowEngine:
             )
             final_mesh.vertex_colors = o3d.utility.Vector3dVector(final_colors)
         
-        # Final Point Cloud Generation & Unpainted Vertex Filtering
         final_pcd = o3d.geometry.PointCloud()
         if final_mesh is not None and len(final_mesh.vertices) > 0:
             valid_color_mask = final_colors.sum(axis=1) > 0.0
