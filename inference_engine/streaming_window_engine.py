@@ -287,16 +287,17 @@ class StreamingWindowEngine:
                 )
             profiler["Nvblox_Enqueue"] = time.time() - t3
             
-            avg_alloc, max_alloc, avg_res, max_res = self.vram_tracker.stop()
+            pt_alloc, pt_res, sys_used, sys_total = self.vram_tracker.stop()
             total_time = time.time() - t_win_start
             
             print("  --- Performance Profile ---")
-            for k, v in profiler.items():
-                print(f"    - {k:<30}: {v:.4f} sec")
+            for k, v in sorted(profiler.items()):
+                print(f"    - {k:<25}: {v:.4f} sec")
             print(f"  >>> Total Cycle Time: {total_time:.4f} sec")
             print("  --- GPU Memory (VRAM) ---")
-            print(f"    - Allocated : {avg_alloc:.2f} GB (Avg) | {max_alloc:.2f} GB (Peak)")
-            print(f"    - Reserved  : {avg_res:.2f} GB (Avg) | {max_res:.2f} GB (Peak)")
+            print(f"    - PyTorch Peak Alloc : {pt_alloc:.2f} GB")
+            print(f"    - PyTorch Peak Rsvd  : {pt_res:.2f} GB")
+            print(f"    - True System VRAM   : {sys_used:.2f} GB / {sys_total:.2f} GB")
 
             self.submap_count += 1
             
