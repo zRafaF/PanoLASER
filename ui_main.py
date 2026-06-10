@@ -172,14 +172,22 @@ def process_sequence_ui(
 
     for mesh, global_pcd, trajectory, lc_edges in streaming_engine.process_sequence(frames, masks):
         fig = create_plotly_figure_with_trajectory(global_pcd, trajectory, lc_edges)
-        pcd_path = save_pcd_to_ply(global_pcd, "live_map")
+        
+        temp_dir = tempfile.mkdtemp()
+        gs_ply_path = os.path.join(temp_dir, f"true_3dgs_map_submap_{streaming_engine.submap_count}.ply")
+        try:
+            streaming_engine.gs_mapper.save_ply(gs_ply_path)
+        except Exception as e:
+            print(f"Error saving 3DGS file: {e}")
+            gs_ply_path = None
         
         if mesh is None or len(mesh.vertices) == 0:
-            yield fig, pcd_path, None, None, gr.update(interactive=False)
+            # Yield gs_ply_path instead of the old pcd_path
+            yield fig, gs_ply_path, None, None, gr.update(interactive=False)
         else:
             backend_state["mesh"] = mesh
             mesh_path = save_mesh_to_glb(mesh, "final_scene")
-            yield fig, pcd_path, mesh_path, mesh_path, gr.update(interactive=True)
+            yield fig, gs_ply_path, mesh_path, mesh_path, gr.update(interactive=True)
 
 def run_texture_optimization():
     if backend_state["mesh"] is None or len(backend_state["frames"]) == 0:

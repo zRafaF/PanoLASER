@@ -174,4 +174,59 @@ class PanoGaussianMapper(nn.Module):
     @torch.no_grad()
     def save_ply(self, path):
         """Exports standard 3DGS .ply for WebGL viewers (SuperSplat, PlayCanvas)"""
-        pass
+        import plyfile
+        
+        if self.means.shape[0] == 0:
+            print("No Gaussians to save.")
+            return
+
+        # 1. Filter out completely invisible or dead Gaussians
+        valid_mask = torch.sigmoid(self.opacities) > 0.05
+        
+        xyz = self.means[valid_mask].cpu().numpy()
+        normals = np.zeros_like(xyz)
+        
+        # 2. Convert Sigmoid Colors back to Spherical Harmonics (SH0)
+        # Standard 3DGS viewers expect colors as SH coefficients, not 0-1 RGB.
+        rgb = torch.sigmoid(self.colors[valid_mask]).cpu().numpy()
+        f_dc = (rgb - 0.5) / 0.28209479177387814
+        
+        # 3. Extract properties (already in the correct Log / Logit space for viewers)
+        opacities = self.opacities[valid_mask].unsqueeze(-1).cpu().numpy()
+        scales = self.scales[valid_mask].cpu().numpy()
+        
+        # 4. Normalize Quaternions (W, X, Y, Z)
+        quats = F.normalize(self.quats[valid_mask], p=2, dim=-1).cpu().numpy()
+        
+        # 5. Construct the strict binary structure expected by 3DGS viewers
+        dtype_full = [
+            ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+            ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+            ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4'),
+            ('opacity', 'f4'),
+            ('scale_0', 'f4'), ('scale_1', 'f4'), ('scale_2', 'f4'),
+            ('rot_0', 'f4'), ('rot_1', 'f4'), ('rot_2', 'f4'), ('rot_3', 'f4')
+        ]
+        
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        elements['x'] = xyz[:, 0]
+        elements['y'] = xyz[:, 1]
+        elements['z'] = xyz[:, 2]
+        elements['nx'] = normals[:, 0]
+        elements['ny'] = normals[:, 1]
+        elements['nz'] = normals[:, 2]
+        elements['f_dc_0'] = f_dc[:, 0]
+        elements['f_dc_1'] = f_dc[:, 1]
+        elements['f_dc_2'] = f_dc[:, 2]
+        elements['opacity'] = opacities[:, 0]
+        elements['scale_0'] = scales[:, 0]
+        elements['scale_1'] = scales[:, 1]
+        elements['scale_2'] = scales[:, 2]
+        elements['rot_0'] = quats[:, 0]
+        elements['rot_1'] = quats[:, 1]
+        elements['rot_2'] = quats[:, 2]
+        elements['rot_3'] = quats[:, 3]
+        
+        el = plyfile.PlyElement.describe(elements, 'vertex')
+        plyfile.PlyData([el]).write(path)
+        print(f"✅ Saved True Gaussian Splat map with {xyz.shape[0]} splats to {path}")
