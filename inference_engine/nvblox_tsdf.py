@@ -15,7 +15,7 @@ class NvbloxPanoTSDF:
         self.face_size = face_size
         self.crop_margin = crop_margin
         
-        print(f"[TSDF] Initializing C++ Nvblox Mapper ({voxel_size_m}m Voxels, Strict Truncation, {max_depth}m Cap)...")
+        print(f"[TSDF] Initializing C++ Nvblox Mapper ({voxel_size_m}m Voxels, Anti-Erosion Enabled, {max_depth}m Cap)...")
         
         proj_params = ProjectiveIntegratorParams()
         proj_params.projective_integrator_max_integration_distance_m = self.max_depth
@@ -77,6 +77,9 @@ class NvbloxPanoTSDF:
         if isinstance(pose, np.ndarray):
             pose = torch.from_numpy(pose).float().to(self.device)
             
+        if torch.isnan(pose).any() or torch.isinf(pose).any():
+            return
+            
         if mask is not None:
             if isinstance(mask, np.ndarray):
                 mask = torch.from_numpy(mask.copy()).float().to(self.device)
@@ -86,52 +89,50 @@ class NvbloxPanoTSDF:
             mask = torch.ones_like(pano_depth_map)
             
         # =========================================================
-        # THE PROTECTIVE FORCEFIELD (RAY-SHIELDING HALO)
+        # ANTI-EROSION FORCEFIELD (Prevents Free-Space Carving)
         # =========================================================
+        # We calculate the spatial derivative of the depth map
         depth_shifted_x = torch.roll(pano_depth_map, shifts=-1, dims=1)
         depth_shifted_y = torch.roll(pano_depth_map, shifts=-1, dims=0)
         diff_x = torch.abs(pano_depth_map - depth_shifted_x)
         diff_y = torch.abs(pano_depth_map - depth_shifted_y)
         
+        # 1. Micro-aliasing guard: Filter out tiny 8cm jagged pixel noise 
         edge_mask = (diff_x < 0.08) & (diff_y < 0.08)
         mask = mask * edge_mask.float()
         
-        silhouette_edges = ((diff_x > 0.20) | (diff_y > 0.20)).float()
+        # 2. Thin Object Protection: Detect sharp depth jumps > 15cm (e.g. edge of a whiteboard)
+        silhouette_edges = ((diff_x > 0.15) | (diff_y > 0.15)).float()
         edges_tensor = silhouette_edges.unsqueeze(0).unsqueeze(0)
         
+        # 3. Dilate the edges using Max Pooling. 
+        # A kernel of 7 creates a 3-pixel wide "deadzone" around all thin objects.
+        # Nvblox will not cast rays here, so it cannot accidentally erode the object.
         dilated_edges = F.max_pool2d(edges_tensor, kernel_size=7, stride=1, padding=3).squeeze()
         mask = mask * (dilated_edges == 0.0).float()
         # =========================================================
 
-        use_color = False 
-        pano_rgb_tensor = None
-            
         pano_depth_tensor = pano_depth_map.unsqueeze(0).unsqueeze(0)
         pano_mask_tensor = mask.unsqueeze(0).unsqueeze(0)
 
         for i in range(6):
-            # align_corners=False prevents 1-pixel spherical wrapping bugs
+            # align_corners=False required to prevent 360-degree wrapping seams
             radial_depth = F.grid_sample(
                 pano_depth_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=False
             ).squeeze(0).squeeze(0)
             
-            # CRITICAL: Sanitize NaNs and Infs to prevent stdgpu CUDA 700 crashes
             radial_depth = torch.nan_to_num(radial_depth, nan=-1.0, posinf=-1.0, neginf=-1.0)
             
             face_mask = F.grid_sample(
                 pano_mask_tensor, self.batched_grids[i:i+1], mode='nearest', align_corners=False
             ).squeeze(0).squeeze(0)
 
-            # Hardcoded 0.35 nadir_mask removed here to prevent "double-masking" outline
-
             optical_depth = radial_depth * self.batched_z_mults[i]
             optical_depth[face_mask < 0.5] = -1.0
             
             optical_depth[optical_depth > self.max_depth] = -1.0
-            optical_depth[optical_depth < 0.1] = -1.0 # Ensure no negative/zero anomalies slip through
+            optical_depth[optical_depth < 0.1] = -1.0 
             
-            color_face_uint8 = None
-
             if self.crop_margin > 0:
                 c = self.crop_margin
                 optical_depth = optical_depth[c:-c, c:-c].contiguous()
@@ -143,5 +144,6 @@ class NvbloxPanoTSDF:
             self.mapper.add_depth_frame(optical_depth, face_pose_cpu, self.camera)
 
     def extract_mesh(self):
+        # We extract pure uncolored geometry; Python shader will paint it
         self.mapper.update_color_mesh()
         return self.mapper.get_color_mesh().to_open3d()

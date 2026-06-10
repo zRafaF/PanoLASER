@@ -28,7 +28,7 @@ class StreamingWindowEngine:
         self.tsdf_future = None
         self.tsdf = None
         
-        print("[Engine] Initializing Dynamic C++ Nvblox Keyframe Engine...")
+        print("[Engine] Initializing PyTorch Shaded TSDF Engine...")
         self.reset()
         
     def reset(self):
@@ -66,6 +66,10 @@ class StreamingWindowEngine:
 
     @torch.no_grad()
     def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_depths, batch_masks, batch_poses):
+        """
+        Projects mesh vertices back into panoramic keyframes.
+        Features: Distance Attenuation, Z-Buffer Occlusion, Lens Confidence, and Anti-Smear.
+        """
         num_pts = vertices_np.shape[0]
         if num_pts == 0 or len(batch_rgbs) == 0:
             return np.zeros((num_pts, 3))
@@ -104,12 +108,15 @@ class StreamingWindowEngine:
 
             valid_mask_hit = sampled_masks > 0.5
             is_not_black = sampled_colors.sum(dim=1) > 0.15
+            
+            # Z-Buffer Occlusion: Prevent painting objects hiding behind walls
             depth_tolerance = 0.15 
             is_visible = dist <= (sampled_depths + depth_tolerance)
 
             view_dirs_w = (t_w_c - vertices) / (dist.unsqueeze(1) + 1e-6)
             dot_prod = (view_dirs_w * normals).sum(dim=1)
             
+            # Lens Confidence penalizes distorted top/bottom poles of equirectangular images
             lens_confidence = torch.cos(phi)
             
             valid_condition = (dist > 0.1) & valid_mask_hit & is_visible & (dot_prod > 0) & is_not_black
@@ -234,7 +241,6 @@ class StreamingWindowEngine:
 
                         scaled_pts = pts_list[j] * self.current_metric_scale
                         depth_map = np.linalg.norm(scaled_pts, axis=-1)
-                        
                         depth_map = np.nan_to_num(depth_map, nan=0.0, posinf=0.0, neginf=0.0)
                         
                         batch_depths.append(depth_map)
@@ -278,13 +284,7 @@ class StreamingWindowEngine:
             self.submap_count += 1
             
             if self.submap_count % 3 == 0:
-                
-                # ==============================================================
-                # CRITICAL RACE-CONDITION FIX:
-                # We MUST wait for the background integration thread to finish
-                # BEFORE we ask the GPU to extract the mesh. Otherwise they both
-                # try to access/resize the Hash Map memory at the exact same time.
-                # ==============================================================
+                # Lock background thread before requesting geometry
                 if self.tsdf_future is not None:
                     self.tsdf_future.result()
                     self.tsdf_future = None
@@ -309,6 +309,7 @@ class StreamingWindowEngine:
 
                 self.last_pcd = o3d.geometry.PointCloud()
                 if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
+                    # Filter out unpainted vertices so they don't look like floating dust
                     valid_color_mask = colored_vertices.sum(axis=1) > 0.0
                     filtered_points = np.asarray(self.last_mesh.vertices)[valid_color_mask]
                     filtered_colors = colored_vertices[valid_color_mask]
