@@ -69,7 +69,7 @@ class StreamingWindowEngine:
     def _apply_pytorch_colors(self, vertices_np, normals_np, batch_rgbs, batch_depths, batch_masks, batch_poses):
         """
         Projects mesh vertices back into panoramic keyframes.
-        Features: Distance Attenuation, Angle Alignment, Z-Buffer Occlusion, and Deadzone Masking.
+        Features: Distance Attenuation, Z-Buffer Occlusion, Lens Confidence, and Anti-Smear.
         """
         num_pts = vertices_np.shape[0]
         if num_pts == 0 or len(batch_rgbs) == 0:
@@ -113,24 +113,35 @@ class StreamingWindowEngine:
 
             # --- THE FIXES ---
             
-            # A. Mask Check: Did we hit the black pole/sky?
+            # A. Mask Check: Did we hit the valid mask?
             valid_mask_hit = sampled_masks > 0.5
             
-            # B. Z-Buffer Occlusion: Is the vertex hiding behind a surface?
-            # We add a 15cm tolerance (0.15) to account for mesh smoothing/quantization
+            # B. Anti-Smear Check: Is the sampled pixel practically black?
+            # Even if the mask bleeds, if the pixel is black (the tripod/pole), ignore it entirely.
+            is_not_black = sampled_colors.sum(dim=1) > 0.05
+            
+            # C. Z-Buffer Occlusion: Is the vertex hiding behind a surface?
             depth_tolerance = 0.15 
             is_visible = dist <= (sampled_depths + depth_tolerance)
 
-            # C. Score Calculation
+            # D. View Alignment
             view_dirs_w = (t_w_c - vertices) / (dist.unsqueeze(1) + 1e-6)
             dot_prod = (view_dirs_w * normals).sum(dim=1)
             
-            # Must be front-facing AND unoccluded AND inside the valid mask
-            valid_condition = (dist > 0.1) & valid_mask_hit & is_visible & (dot_prod > 0)
+            # E. Lens Confidence (Equirectangular Penalty)
+            # The poles of a 360 image are heavily distorted. 
+            # cos(phi) equals 1.0 at the horizon and drops to 0.0 at the exact top/bottom.
+            # This mathematically forces the algorithm to prefer painting the floor using 
+            # a camera looking AT the floor from an angle, rather than one directly ABOVE it.
+            lens_confidence = torch.cos(phi)
+            
+            # F. Final Validation
+            valid_condition = (dist > 0.1) & valid_mask_hit & is_visible & (dot_prod > 0) & is_not_black
 
+            # Modifying the heuristic to include Lens Confidence
             score = torch.where(
                 valid_condition,
-                dot_prod / (dist**2 + 1e-6),
+                (dot_prod * lens_confidence) / (dist**2 + 1e-6),
                 torch.tensor(-1.0, device=self.device)
             )
 
@@ -313,10 +324,16 @@ class StreamingWindowEngine:
                     self.last_mesh.vertex_colors = o3d.utility.Vector3dVector(colored_vertices)
                     print(f"  > [Coloring] PyTorch Raycasting applied to {len(self.last_mesh.vertices)} vertices in {time.time() - t_color_start:.4f} sec")
 
+                # Point Cloud Generation & Unpainted Vertex Filtering
                 self.last_pcd = o3d.geometry.PointCloud()
-                self.last_pcd.points = self.last_mesh.vertices
-                if self.last_mesh.has_vertex_colors():
-                    self.last_pcd.colors = self.last_mesh.vertex_colors
+                if self.last_mesh is not None and len(self.last_mesh.vertices) > 0:
+                    # Drop vertices that remained black (unpainted) so they don't look like dust
+                    valid_color_mask = colored_vertices.sum(axis=1) > 0.0
+                    filtered_points = np.asarray(self.last_mesh.vertices)[valid_color_mask]
+                    filtered_colors = colored_vertices[valid_color_mask]
+                    
+                    self.last_pcd.points = o3d.utility.Vector3dVector(filtered_points)
+                    self.last_pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
 
             yield_mesh = self.last_mesh
             yield_pcd = self.last_pcd
@@ -342,7 +359,7 @@ class StreamingWindowEngine:
         print("[Engine] Final Sequence: Extracting Unified Global Mesh...")
         final_mesh = self.tsdf.extract_mesh()
         
-        # Apply Final Global Coloring (FIXED)
+        # Apply Final Global Coloring
         if final_mesh is not None and len(final_mesh.vertices) > 0:
             final_mesh.compute_vertex_normals()
             final_colors = self._apply_pytorch_colors(
@@ -355,10 +372,15 @@ class StreamingWindowEngine:
             )
             final_mesh.vertex_colors = o3d.utility.Vector3dVector(final_colors)
         
+        # Final Point Cloud Generation & Unpainted Vertex Filtering
         final_pcd = o3d.geometry.PointCloud()
-        final_pcd.points = final_mesh.vertices
-        if final_mesh.has_vertex_colors():
-            final_pcd.colors = final_mesh.vertex_colors
+        if final_mesh is not None and len(final_mesh.vertices) > 0:
+            valid_color_mask = final_colors.sum(axis=1) > 0.0
+            filtered_points = np.asarray(final_mesh.vertices)[valid_color_mask]
+            filtered_colors = final_colors[valid_color_mask]
+            
+            final_pcd.points = o3d.utility.Vector3dVector(filtered_points)
+            final_pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
 
         print(f"\n[Engine] Sequence mapped in {time.time() - t_seq_start:.4f} sec.")
         yield final_mesh, final_pcd, np.array(self.trajectory), []
