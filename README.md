@@ -108,6 +108,34 @@ cd ../nvblox_torch
 uv pip install --editable .
 ```
 
+## Building nvblox wheeels
+
+``` bash
+apt-get update && apt-get install -y git-lfs cmake build-essential python3-dev
+git lfs install
+git clone -b v0.0.10 https://github.com/zRafaF/nvblox.git
+cd nvblox
+source ../.venv/bin/activate
+
+mkdir build && cd build
+cmake .. -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch.utils; print(torch.utils.cmake_prefix_path)')" -DBUILD_RENDERER=0
+
+make -j$(nproc)
+cd ../nvblox_torch
+
+SETUPTOOLS_SCM_PRETEND_VERSION="0.0.10+cu124ubuntu22" uv build --wheel --no-config \
+  --config-setting="--build-option=--plat-name" \
+  --config-setting="--build-option=linux_x86_64"
+```
+
+After building them you can upload them somewhere and then during the instalation process you should replace the pip install command with the link to the wheel you just built, for example:
+
+```bash
+uv pip install https://github.com/zRafaF/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10.dev1+cuubuntu22-py3-none-linux_x86_64.whl
+```
+
+
+
 ## 🚀 Usage
 
 Whenever you execute scripts or run tests in this repository, prepend your command with `uv run` to automatically trigger execution inside the locked dependencies network without manually activating anything:
@@ -144,22 +172,8 @@ uv sync
 mkdir -p checkpoints
 wget https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt -O checkpoints/model.pt
 
-apt-get update && apt-get install -y git-lfs cmake build-essential python3-dev
-git lfs install
-git clone -b v0.0.10 https://github.com/zRafaF/nvblox.git
-cd nvblox
-source ../.venv/bin/activate
-
-mkdir build && cd build
-cmake .. -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch.utils; print(torch.utils.cmake_prefix_path)')" -DBUILD_RENDERER=0
-
-make -j$(nproc)
-cd ../nvblox_torch
-uv pip install --editable .
-cd ../../
-
-
-
+## If needed replace with your own wheel or consult the official documentation https://nvidia-isaac.github.io/nvblox/v0.0.10/pages/installation.html
+uv pip install https://github.com/zRafaF/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10.dev1+cuubuntu22-py3-none-linux_x86_64.whl
 
 ##### PATH
 /root/PanoLASER/examples/resized
